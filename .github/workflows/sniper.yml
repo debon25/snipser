@@ -1,0 +1,45 @@
+name: Kufar Sniper 3.0
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: kufar-sniper-v3-singleton
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Скачивание кода
+        uses: actions/checkout@v4
+
+      - name: Восстановление SQLite базы и настроек
+        uses: actions/cache@v4
+        with:
+          path: |
+            sniper.db
+            settings.json
+          key: sniper-v3-db-${{ github.run_id }}
+          restore-keys: |
+            sniper-v3-db-
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установка библиотек
+        run: pip install requests rapidfuzz
+
+      - name: Запуск Kufar Sniper 3.0
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          MAX_RUN_HOURS: '5.8'
+        run: python -u sniper.py
