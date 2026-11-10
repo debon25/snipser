@@ -31,7 +31,7 @@ MIN_INTERVAL = 7
 MAX_INTERVAL = 12
 TG_POLL_INTERVAL = 1.0       # Кнопки в ТГ опрашиваются каждую 1 секунду
 MARKET_CACHE_TTL = 4 * 3600  # Кэш рынка живет 4 часа
-MIN_VALID_SAMPLE = 3         # СНИЖЕНО ДО 3: не дропаем редкие модели, а ставим тег малой выборки (<8)
+MIN_VALID_SAMPLE = 8         # Минимум объявлений для признания модели ликвидной
 
 MINSK_DISTRICTS = [
     "Фрунзенский", "Московский", "Первомайский", "Советский",
@@ -48,7 +48,7 @@ DEFAULT_SETTINGS = {
     "fat_profit_pct": 22,         # % выгоды для ЖИРА (со звуком)
     "urgent_profit_byn": 55,      # Выгода при триггере срочности
     "work_profit_byn": 40,        # Рабочий вариант (без звука)
-    "inspect_min_profit": 15,     # СНИЖЕНО ДО 15 BYN: чтобы видеть лоты под торг в ЛС
+    "inspect_min_profit": 25,     # Под осмотр (без звука)
     "last_digest_date": ""
 }
 
@@ -56,152 +56,7 @@ DEFAULT_SETTINGS = {
 USER_WAIT_STATE = {"mode": None}
 
 # ================= 1. РАСШИРЕННЫЙ БЕЛЫЙ СПИСОК МОДЕЛЕЙ =================
-SEP = r"[\s\-_.]*"
-NO_SUFFIX = rf"(?!{SEP}(?:pro|про|max|макс|mini|мини|plus|плюс|\+|ultra|ультра|fe|фе|lite|лайт)\b)"
-
-MODELS_WHITELIST = [
-    # --- APPLE iPHONE (от XR до 15 Pro Max) ---
-    ("iPhone 15 Pro Max", "apple", rf"\b15{SEP}(?:pro{SEP}max|про{SEP}макс|промакс|promax)\b", [256, 512, 1024], "iPhone 15 Pro Max"),
-    ("iPhone 15 Pro", "apple", rf"\b15{SEP}(?:pro|про)\b(?!{SEP}(?:max|макс))", [128, 256, 512, 1024], "iPhone 15 Pro"),
-    ("iPhone 15 Plus", "apple", rf"\b15{SEP}(?:\+|plus|плюс)\b", [128, 256, 512], "iPhone 15 Plus"),
-    ("iPhone 15", "apple", rf"(?:(?:iphone|айфон|айф){SEP}15\b|\b15{SEP}(?:айфон|iphone)\b){NO_SUFFIX}", [128, 256, 512], "iPhone 15"),
-
-    ("iPhone 14 Pro Max", "apple", rf"\b14{SEP}(?:pro{SEP}max|про{SEP}макс|промакс|promax)\b", [128, 256, 512, 1024], "iPhone 14 Pro Max"),
-    ("iPhone 14 Pro", "apple", rf"\b14{SEP}(?:pro|про)\b(?!{SEP}(?:max|макс))", [128, 256, 512, 1024], "iPhone 14 Pro"),
-    ("iPhone 14 Plus", "apple", rf"\b14{SEP}(?:\+|plus|плюс)\b", [128, 256, 512], "iPhone 14 Plus"),
-    ("iPhone 14", "apple", rf"(?:(?:iphone|айфон|айф){SEP}14\b|\b14{SEP}(?:айфон|iphone)\b){NO_SUFFIX}", [128, 256, 512], "iPhone 14"),
-
-    ("iPhone 13 Pro Max", "apple", rf"\b13{SEP}(?:pro{SEP}max|про{SEP}макс|промакс|promax)\b", [128, 256, 512, 1024], "iPhone 13 Pro Max"),
-    ("iPhone 13 Pro", "apple", rf"\b13{SEP}(?:pro|про)\b(?!{SEP}(?:max|макс))", [128, 256, 512, 1024], "iPhone 13 Pro"),
-    ("iPhone 13 mini", "apple", rf"\b13{SEP}(?:mini|мини)\b", [128, 256, 512], "iPhone 13 mini"),
-    ("iPhone 13", "apple", rf"(?:(?:iphone|айфон|айф){SEP}13\b|\b13{SEP}(?:айфон|iphone)\b){NO_SUFFIX}", [128, 256, 512], "iPhone 13"),
-
-    ("iPhone 12 Pro Max", "apple", rf"\b12{SEP}(?:pro{SEP}max|про{SEP}макс|промакс|promax)\b", [128, 256, 512], "iPhone 12 Pro Max"),
-    ("iPhone 12 Pro", "apple", rf"\b12{SEP}(?:pro|про)\b(?!{SEP}(?:max|макс))", [128, 256, 512], "iPhone 12 Pro"),
-    ("iPhone 12 mini", "apple", rf"\b12{SEP}(?:mini|мини)\b", [64, 128, 256], "iPhone 12 mini"),
-    ("iPhone 12", "apple", rf"(?:(?:iphone|айфон|айф){SEP}12\b|\b12{SEP}(?:айфон|iphone)\b|\bдвенадцатый\s*айфон\b){NO_SUFFIX}", [64, 128, 256], "iPhone 12"),
-
-    ("iPhone 11 Pro Max", "apple", rf"\b11{SEP}(?:pro{SEP}max|про{SEP}макс|промакс|promax)\b", [64, 256, 512], "iPhone 11 Pro Max"),
-    ("iPhone 11 Pro", "apple", rf"\b11{SEP}(?:pro|про)\b(?!{SEP}(?:max|макс))", [64, 256, 512], "iPhone 11 Pro"),
-    ("iPhone 11", "apple", rf"(?:(?:iphone|айфон|айф){SEP}11\b|\b11{SEP}(?:айфон|iphone)\b|\bодиннадцатый\s*айфон\b){NO_SUFFIX}", [64, 128, 256], "iPhone 11"),
-
-    ("iPhone XS Max", "apple", rf"\b(?:xs|хс|икс{SEP}эс){SEP}(?:max|макс)\b", [64, 256, 512], "iPhone XS Max"),
-    ("iPhone XS", "apple", rf"\b(?:xs|хс|икс{SEP}эс)\b(?!{SEP}(?:max|макс))", [64, 256, 512], "iPhone XS"),
-    ("iPhone XR", "apple", rf"\b(?:xr|хр|икс{SEP}эр|хr)\b", [64, 128, 256], "iPhone XR"),
-    ("iPhone SE 2022", "apple", rf"\bse{SEP}(?:2022|3|22)\b", [64, 128, 256], "iPhone SE 2022"),
-    ("iPhone SE 2020", "apple", rf"\bse{SEP}(?:2020|2|20)\b", [64, 128, 256], "iPhone SE 2020"),
-
-    # --- SAMSUNG ---
-    ("Samsung S24 Ultra", "android", rf"\bs{SEP}24{SEP}(?:ultra|ультра)\b", [256, 512, 1024], "Samsung S24 Ultra"),
-    ("Samsung S24 Plus", "android", rf"\bs{SEP}24{SEP}(?:\+|plus|плюс)\b", [256, 512], "Samsung S24 Plus"),
-    ("Samsung S24", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}s{SEP}24\b{NO_SUFFIX}", [128, 256], "Samsung S24"),
-
-    ("Samsung S23 Ultra", "android", rf"\bs{SEP}23{SEP}(?:ultra|ультра)\b", [256, 512, 1024], "Samsung S23 Ultra"),
-    ("Samsung S23 Plus", "android", rf"\bs{SEP}23{SEP}(?:\+|plus|плюс)\b", [256, 512], "Samsung S23 Plus"),
-    ("Samsung S23 FE", "android", rf"\bs{SEP}23{SEP}(?:fe|фе)\b", [128, 256], "Samsung S23 FE"),
-    ("Samsung S23", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}s{SEP}23\b{NO_SUFFIX}", [128, 256], "Samsung S23"),
-
-    ("Samsung S22 Ultra", "android", rf"\bs{SEP}22{SEP}(?:ultra|ультра)\b", [128, 256, 512], "Samsung S22 Ultra"),
-    ("Samsung S22 Plus", "android", rf"\bs{SEP}22{SEP}(?:\+|plus|плюс)\b", [128, 256], "Samsung S22 Plus"),
-    ("Samsung S22", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}s{SEP}22\b{NO_SUFFIX}", [128, 256], "Samsung S22"),
-
-    ("Samsung S21 FE", "android", rf"\bs{SEP}21{SEP}(?:fe|фе)\b", [128, 256], "Samsung S21 FE"),
-    ("Samsung S21 Plus", "android", rf"\bs{SEP}21{SEP}(?:\+|plus|плюс)\b", [128, 256], "Samsung S21 Plus"),
-    ("Samsung S21", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}s{SEP}21\b{NO_SUFFIX}", [128, 256], "Samsung S21"),
-    ("Samsung S20 FE", "android", rf"\bs{SEP}20{SEP}(?:fe|фе)\b", [128, 256], "Samsung S20 FE"),
-
-    ("Samsung A55", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}(?:a|а){SEP}55\b", [128, 256], "Samsung A55"),
-    ("Samsung A54", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}(?:a|а){SEP}54\b", [128, 256], "Samsung A54"),
-    ("Samsung A53", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}(?:a|а){SEP}53\b", [128, 256], "Samsung A53"),
-    ("Samsung A52", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}(?:a|а){SEP}52\b", [128, 256], "Samsung A52"),
-    ("Samsung A35", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}(?:a|а){SEP}35\b", [128, 256], "Samsung A35"),
-    ("Samsung A34", "android", rf"\b(?:samsung|самсунг|galaxy)?{SEP}(?:a|а){SEP}34\b", [128, 256], "Samsung A34"),
-
-    # --- XIAOMI / REDMI / POCO ---
-    ("Redmi Note 13 Pro Plus", "android", rf"\b(?:redmi|редми)?{SEP}(?:note|ноут){SEP}13{SEP}(?:pro|про){SEP}(?:\+|plus|плюс)\b", [256, 512], "Redmi Note 13 Pro Plus"),
-    ("Redmi Note 13 Pro", "android", rf"\b(?:redmi|редми)?{SEP}(?:note|ноут){SEP}13{SEP}(?:pro|про)\b(?!{SEP}(?:\+|plus|плюс))", [128, 256, 512], "Redmi Note 13 Pro"),
-    ("Redmi Note 13", "android", rf"\b(?:redmi|редми)?{SEP}(?:note|ноут){SEP}13\b{NO_SUFFIX}", [128, 256], "Redmi Note 13"),
-    ("Redmi Note 12 Pro", "android", rf"\b(?:redmi|редми)?{SEP}(?:note|ноут){SEP}12{SEP}(?:pro|про)\b(?!{SEP}(?:\+|plus|плюс))", [128, 256], "Redmi Note 12 Pro"),
-    ("Redmi Note 12", "android", rf"\b(?:redmi|редми)?{SEP}(?:note|ноут){SEP}12\b{NO_SUFFIX}", [64, 128, 256], "Redmi Note 12"),
-    ("Redmi Note 11 Pro", "android", rf"\b(?:redmi|редми)?{SEP}(?:note|ноут){SEP}11{SEP}(?:pro|про)\b", [64, 128], "Redmi Note 11 Pro"),
-
-    ("Poco F6 Pro", "android", rf"\b(?:poco|поко){SEP}(?:f|ф){SEP}6{SEP}(?:pro|про)\b", [256, 512], "Poco F6 Pro"),
-    ("Poco F6", "android", rf"\b(?:poco|поко){SEP}(?:f|ф){SEP}6\b{NO_SUFFIX}", [256, 512], "Poco F6"),
-    ("Poco F5", "android", rf"\b(?:poco|поко){SEP}(?:f|ф){SEP}5\b{NO_SUFFIX}", [256], "Poco F5"),
-    ("Poco F4", "android", rf"\b(?:poco|поко){SEP}(?:f|ф){SEP}4\b{NO_SUFFIX}", [128, 256], "Poco F4"),
-    ("Poco X6 Pro", "android", rf"\b(?:poco|поко){SEP}(?:x|х){SEP}6{SEP}(?:pro|про)\b", [256, 512], "Poco X6 Pro"),
-    ("Poco X6", "android", rf"\b(?:poco|поко){SEP}(?:x|х){SEP}6\b{NO_SUFFIX}", [256, 512], "Poco X6"),
-    ("Poco X5 Pro", "android", rf"\b(?:poco|поко){SEP}(?:x|х){SEP}5{SEP}(?:pro|про)\b", [128, 256], "Poco X5 Pro"),
-    ("Poco X5", "android", rf"\b(?:poco|поко){SEP}(?:x|х){SEP}5\b{NO_SUFFIX}",Вот обновленный монолитный код **Kufar Sniper 3.3 (`sniper.py`)**, в котором расширена воронка и внедрены все 7 правок:
-
-1. **Умное окно отрицаний (40 символов):** Функция `has_marker_without_negation` теперь находит маркер и проверяет срез до 40 символов перед ним (до ближайшей точки или переноса строки). Фразы вроде *«без царапин, сколов и трещин»* или *«не в кредите и не в рассрочке»* больше не приводят к ложному бану.
-2. **Порог `MIN_VALID_SAMPLE = 3`:** Редкие модели больше не отбрасываются. Если в выборке от 3 до 7 объявлений, бот пришлет лот с тегом `⚠️ Мало данных для рынка (n=...)`.
-3. **Учет `is_assumed_mem` с весом `0.5`:** Объявления без указанной памяти теперь участвуют в расчете рынка с половинным весом (`weight * 0.5`), наполняя базу и не перекашивая медиану.
-4. **Мягкий фильтр районов (>30 BYN):** Лоты из соседних районов проходят фильтр с плашкой `📍 Вне твоего района`, если чистая выгода составляет от 30 BYN.
-5. **Расширенный `has_explicit_iphone`:** Модификации `pro max`, `про макс`, `mini`, `мини`, `xs`, `xr`, `se` (при отсутствии Android-брендов в заголовке) автоматически распознаются как iPhone даже без слова «айфон».
-6. **Порог `inspect_min_profit = 15`:** Снижен минимальный порог выгоды для чистых аппаратов («Под осмотр»), чтобы ты видел больше вариантов под торг в ЛС.
-
-### Полный код `sniper.py` (Версия 3.3)
-
-```python
-import os
-import re
-import sys
-import json
-import time
-import random
-import html
-import sqlite3
-import signal
-import atexit
-import datetime
-import statistics
-import requests
-
-try:
-    from rapidfuzz import process as fuzz_process, fuzz
-    HAS_RAPIDFUZZ = True
-except ImportError:
-    HAS_RAPIDFUZZ = False
-
-# ================= БАЗОВЫЕ НАСТРОЙКИ И СЕКРЕТЫ =================
-TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "1091251853").strip()
-PROXY_URL = os.getenv("PROXY_URL", "").strip()
-MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.8"))
-
-DB_FILE = "sniper.db"
-SETTINGS_FILE = "settings.json"
-
-MIN_INTERVAL = 7
-MAX_INTERVAL = 12
-TG_POLL_INTERVAL = 1.0       # Кнопки в ТГ опрашиваются каждую 1 секунду
-MARKET_CACHE_TTL = 4 * 3600  # Кэш рынка живет 4 часа
-MIN_VALID_SAMPLE = 3         # Снижен порог выборки до 3 (при <8 ставится предупреждающий тег)
-
-MINSK_DISTRICTS = [
-    "Фрунзенский", "Московский", "Первомайский", "Советский",
-    "Центральный", "Заводской", "Ленинский", "Октябрьский", "Партизанский"
-]
-
-DEFAULT_SETTINGS = {
-    "min_price": 120,
-    "max_price": 1500,
-    "bargain_factor": 1.00,       # Коэффициент к очищенной взвешенной медиане
-    "districts": [],              # Пустой список = весь Минск
-    "anchors": {},                # Ручные якоря цен: {"iPhone 13_128GB": 650}
-    "fat_profit_byn": 85,         # Выгода для ЖИРА (со звуком)
-    "fat_profit_pct": 22,         # % выгоды для ЖИРА (со звуком)
-    "urgent_profit_byn": 55,      # Выгода при триггере срочности
-    "work_profit_byn": 40,        # Рабочий вариант (без звука)
-    "inspect_min_profit": 15,     # Снижено до 15 BYN для расширения воронки (без звука)
-    "last_digest_date": ""
-}
-
-# Глобальное состояние ожидания ввода от пользователя в Telegram
-USER_WAIT_STATE = {"mode": None}
-
-# ================= 1. РАСШИРЕННЫЙ БЕЛЫЙ СПИСОК МОДЕЛЕЙ =================
+# Универсальный разделитель (пробел, дефис, точка, подчеркивание или слитно)
 SEP = r"[\s\-_.]*"
 NO_SUFFIX = rf"(?!{SEP}(?:pro|про|max|макс|mini|мини|plus|плюс|\+|ultra|ультра|fe|фе|lite|лайт)\b)"
 
@@ -300,14 +155,17 @@ ANDROID_BRAND_WORDS = [
     r"\bтекно\b", r"\boppo\b", r"\bvivo\b", r"\boneplus\b", r"\bnote\b", r"\bноут\b"
 ]
 
+# Безусловный мусор (чехлы, стекла, коробки, аренда)
 ACCESSORY_GHOST_PATTERNS = [
     r"^\s*(?:чехол|стекло|коробка|кабель|провод|зарядка|блок|наушники)\b",
     r"\bчехол\s+(?:на|для|от)\b", r"\bстекло\s+(?:на|для)\b", r"\bкоробка\s+от\b",
     r"\bаренда\b", r"\bпрокат\b"
 ]
 
+# Покупка/поиск в самом начале заголовка
 BUY_INTENT_TITLE_START = r"^\s*(?:куплю|ищу|сниму|возьму)\b"
 
+# Поколения iPhone, где 100% АКБ на вторичке практически всегда означает замененную банку
 OLD_APPLE_100_BAT_MODELS = {
     "iPhone XR", "iPhone XS", "iPhone XS Max",
     "iPhone SE 2020", "iPhone SE 2022",
@@ -317,6 +175,7 @@ OLD_APPLE_100_BAT_MODELS = {
 }
 
 # ================= 2. РАЗДЕЛЕННЫЕ МАРКЕРЫ БАНА И ШТРАФОВ =================
+# Группа 1: Прямые маркеры (уже содержат "не" или однозначный приговор — банятся напрямую без lookbehind)
 DIRECT_DEAD_MARKERS = [
     "под замену", "на запчасти", "не включается", "не работает", "не заряжается",
     "проблема в порте", "проблема с гнездом", "разъем под замену", "гнездо под замену",
@@ -327,6 +186,7 @@ DIRECT_DEAD_MARKERS = [
     "ошибка аккумулятора", "неизвестная деталь", "только обмен", "обмен только"
 ]
 
+# Группа 2: Маркеры, которые проверяются с защитой от отрицания ("не разбит", "без трещин", "не в кредите")
 NEGATABLE_DEAD_MARKERS = [
     "битая крышка", "разбит", "разбита", "разбито", "трещина", "трещины", "треснут",
     "утопленник", "после воды", "пятно на экране", "пятна на экране",
@@ -336,6 +196,7 @@ NEGATABLE_DEAD_MARKERS = [
     "трейд ин", "trade in"
 ]
 
+# Группа 3: Маркеры ремонта и неоригинальных деталей (тоже проверяются с защитой от "не / без")
 REPAIR_MARKERS = [
     "замена акб", "менялся акб", "менялась акб", "акб менялся", "акб менялась",
     "менялся аккумулятор", "аккумулятор менялся", "новая батарея", "заменена батарея",
@@ -365,7 +226,7 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "Accept": "application/json",
-    "Referer": "[https://www.kufar.by/](https://www.kufar.by/)"
+    "Referer": "https://www.kufar.by/"
 })
 if PROXY_URL:
     session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
@@ -461,6 +322,7 @@ def close_db():
 
 
 def handle_sigterm(signum, frame):
+    """Корректно закрывает БД и завершает процесс при получении SIGTERM от GitHub Actions."""
     close_db()
     sys.exit(0)
 
@@ -491,71 +353,57 @@ def clean_text(text):
 
 
 def has_direct_marker(text, marker):
+    """Прямая проверка для маркеров, которые уже содержат отрицание ('не работает', 'под замену')."""
     t = clean_text(text)
     return bool(re.search(rf"\b{re.escape(marker)}", t))
 
 
 def has_marker_without_negation(text, marker):
-    """
-    Умный поиск маркера с проверкой окна до 40 символов назад.
-    Понимает перечисления: 'без царапин, сколов и трещин', 'экран и корпус не менялись'.
-    """
+    """Проверка маркеров с учетом отрицаний и предлогов ('не разбит', 'не в кредите', 'без сколов')."""
     t = clean_text(text)
-    neg_pattern = r"\b(?:без|не|нет|никаких|никакого|никакой|отсутствуют|отсутствует|нужно\s+без)\b"
-    after_neg_pattern = r"^\s*(?:не\s+было|нет|не\s+обнаружено|не\s+имеет|отсутствуют|отсутствует)\b"
-
-    for m in re.finditer(rf"\b{re.escape(marker)}", t):
-        start_idx = m.start()
-        end_idx = m.end()
-
-        # Берем окно 40 символов перед маркером
-        prefix = t[max(0, start_idx - 40):start_idx]
-        # Обрезаем по границе предыдущего предложения (точка, !, ?, ;, перенос строки)
-        clause = re.split(r"[.!?;:\n]", prefix)[-1]
-
-        # Проверяем на наличие отрицания перед маркером (в пределах текущей фразы)
-        if re.search(neg_pattern, clause):
-            continue
-
-        # Проверяем случай 'трещин нет / ремонтов не было' сразу после маркера
-        suffix = t[end_idx:min(len(t), end_idx + 20)]
-        if re.search(after_neg_pattern, suffix):
-            continue
-
-        return True
-
-    return False
+    pattern = (
+        r"(?<!без\s)(?<!не\s)(?<!не\sв\s)(?<!не\sна\s)"
+        r"(?<!нет\s)(?<!никаких\s)(?<!никакого\s)(?<!точно\sне\s)"
+        rf"\b{re.escape(marker)}"
+    )
+    return bool(re.search(pattern, t))
 
 
 def check_ban_markers(title, description, phone_type="apple", model_id=None):
     t_title = clean_text(title)
     full = clean_text(f"{title} {description}")
 
+    # 1. Аксессуары и аренда
     for pat in ACCESSORY_GHOST_PATTERNS:
         if re.search(pat, full):
             return f"Аксессуар/Аренда: {pat}"
 
+    # 2. Проверка 'куплю / ищу' (баним, если стоит в начале заголовка или если модель не распознана)
     if re.search(BUY_INTENT_TITLE_START, t_title):
         return "Объявление о покупке (Куплю/Ищу в начале заголовка)"
     if not model_id and re.search(r"\b(?:куплю|ищу)\b", t_title):
         return "Объявление о покупке (Куплю/Ищу)"
 
+    # 3. Прямые маркеры трупа (без lookbehind на 'не')
     for m in DIRECT_DEAD_MARKERS:
         if has_direct_marker(full, m):
             return f"Прямой маркер брака: '{m}'"
 
+    # 4. Маркеры трупа с проверкой отрицаний ('не разбит', 'не в рассрочке')
     for m in NEGATABLE_DEAD_MARKERS:
         if has_marker_without_negation(full, m):
             return f"Маркер брака/кредита: '{m}'"
 
+    # 5. Маркеры ремонта (с проверкой отрицаний 'экран не менялся', 'не реф')
     for m in REPAIR_MARKERS:
         if has_marker_without_negation(full, m):
             return f"Маркер ремонта: '{m}'"
 
+    # 6. Умная проверка iCloud / блокировок
     if re.search(r"\b(?:icloud|айклауд|айклауде)\b", full):
         safe_icloud = re.search(
-            r"\b(?:чист\w*|отвязан\w*|отвяжу|выйду|выключен\w*|свобод\w*|мой|личный)\b.{0,30}\b(?:icloud|айклауд)"
-            r"|\b(?:icloud|айклауд\w*)\b.{0,30}\b(?:чист\w*|отвязан\w*|отвяжу|выйду|выключен\w*|свобод\w*|нет|без)\b",
+            r"\b(?:чист\w*|отвязан\w*|отвяжу|выйду|выключен\w*|свобод\w*|мой|личный)\b.{0,25}\b(?:icloud|айклауд)"
+            r"|\b(?:icloud|айклауд\w*)\b.{0,25}\b(?:чист\w*|отвязан\w*|отвяжу|выйду|выключен\w*|свобод\w*|нет|без)\b",
             full
         )
         if not safe_icloud:
@@ -564,6 +412,7 @@ def check_ban_markers(title, description, phone_type="apple", model_id=None):
     if has_marker_without_negation(full, "заблокирован") or has_marker_without_negation(full, "на пароле"):
         return "Заблокирован / На пароле"
 
+    # 7. Фильтр 100% АКБ только для старых поколений iPhone (XR - 13, SE)
     if phone_type == "apple" and (model_id is None or model_id in OLD_APPLE_100_BAT_MODELS):
         if re.search(r"\b(?:акб|батаре[яиюей]|емкость|состояние\s*акб)[\s:=-]*100\s*%", full):
             return f"Подозрительные 100% АКБ на {model_id or 'б/у iPhone'} (вероятна замена банки)"
@@ -573,8 +422,10 @@ def check_ban_markers(title, description, phone_type="apple", model_id=None):
 
 def extract_battery_health(text):
     t = clean_text(text)
+    # 1. Ищем 'акб / батарея / состояние акб' -> X%
     m = re.search(r"(?:акб|батаре[яиюей]|емкость|состояние\s*(?:акб|батаре[яиюей]))[^\d]{0,15}(\d{2,3})\s*%", t)
     if not m:
+        # 2. Ищем X% -> 'акб / батарея / родной' (привязка к слову обязательна!)
         m = re.search(r"\b(6\d|7\d|8\d|9\d|100)\s*%\s*(?:акб|батаре[яиюей]|емкост\w*|родн\w*)", t)
     if m:
         val = int(m.group(1))
@@ -612,7 +463,7 @@ def check_missing_box(text):
 def extract_memory(text, ad_params, valid_memories):
     sorted_mems = sorted(valid_memories, reverse=True)
 
-    # 1. Параметры Куфара (высший приоритет)
+    # 1. Сначала смотрим параметры объявления Куфара (перебор по убыванию)
     if ad_params:
         for p in ad_params:
             if p.get("p") in ("phablet_phones_memory", "mobile_phones_memory", "memory"):
@@ -626,6 +477,7 @@ def extract_memory(text, ad_params, valid_memories):
 
     t = clean_text(text)
 
+    # Проверка на 1 ТБ / 1024 ГБ
     if 1024 in valid_memories and re.search(r"\b(?:1024|1\s*(?:tb|тб|терабайт))\b", t):
         return 1024, False
 
@@ -636,22 +488,25 @@ def extract_memory(text, ad_params, valid_memories):
         if mem in valid_memories:
             return mem, False
 
-    # 3. Явное указание с единицами измерения (по убыванию)
+    # 3. Явное указание с единицами измерения (перебор по убыванию: 'бывают на 64, но у меня на 256 гб')
     for mem in sorted_mems:
         if re.search(rf"\b{mem}\s*(?:гб|gb|гиг|г\b|g\b)|\bна\s*{mem}\b", t):
             return mem, False
 
-    # 4. Голое число памяти
+    # 4. Голое число памяти (с защитой от 'дом 64', 'кв 128', 'зарядка 64W', '64$', '64 дня')
     for mem in sorted_mems:
         pattern = rf"(?<!дом\s)(?<!кв\s)(?<!квартира\s)\b{mem}\b(?!\s*(?:р\b|руб|byn|дол|уе|\$|%|вт|w\b|дн))"
         if re.search(pattern, t):
             return mem, False
 
-    # 5. Если нигде не найдено — берем младшую память с флагом is_assumed_mem = True
     return valid_memories[0], True
 
 
 def resolve_overlapping_models(found_list):
+    """
+    Если нашлось несколько моделей одной линейки, где одна является подмножеством другой
+    (например, 'iPhone 13 Pro' и 'iPhone 13' из-за 'чехол от iPhone 13'), оставляет старшую/специфичную.
+    """
     if len(found_list) <= 1:
         return found_list
     unique_map = {}
@@ -664,6 +519,7 @@ def resolve_overlapping_models(found_list):
     filtered = []
     for item in items:
         m_name = item[0]
+        # Если название этой модели целиком входит в более длинное название другой найденной модели — отбрасываем короткую
         if any(other[0] != m_name and m_name in other[0] for other in items):
             continue
         filtered.append(item)
@@ -671,6 +527,7 @@ def resolve_overlapping_models(found_list):
 
 
 def strip_secondary_device_mentions(text):
+    """Вырезает фразы вроде 'купил iPhone 15 Pro', 'перешел на ...', 'обмен на ...', 'чехол от ...' при поиске модели в описании."""
     pattern = (
         r"\b(?:купил\w*|переш(?:ел|ла|ли)\s+на|обмен\s+на|обменяю\s+на|подарили|взял\s+себе|чехол\s+от)\s+"
         r"(?:iphone|айфон|samsung|самсунг|redmi|редми|poco|поко|pixel|пиксель)?[\s\-_.]*\d{1,2}(?:[\s\-_.]*(?:pro|про|max|макс|mini|мини|plus|плюс|ultra|ультра|fe|фе))*"
@@ -689,16 +546,9 @@ def normalize_phone(title, description="", ad_params=None):
                 param_brand = str(p.get("vl") or p.get("v") or "").lower()
 
     has_android_in_title = any(re.search(w, t_title) for w in ANDROID_BRAND_WORDS)
+    has_explicit_iphone = bool(re.search(r"\b(?:iphone|айфон|айф|apple|эпл|ios)\b", t_full)) or ("apple" in param_brand)
 
-    # СМЯГЧЕНО (Пункт 5): если в тексте есть 'pro max / mini / xs / xr / se', считаем это явным признаком iPhone
-    has_explicit_iphone = (
-        bool(re.search(
-            rf"\b(?:iphone|айфон|айф|apple|эпл|ios|pro{SEP}max|про{SEP}макс|promax|промакс|mini|мини|xs|хс|xr|хр|se)\b",
-            t_full
-        ))
-        or ("apple" in param_brand)
-    )
-
+    # Убираем упоминания 'чехол от ... / обмен на ...' из копии заголовка перед поиском модели
     temp_title = strip_secondary_device_mentions(t_title)
     found_in_title = []
 
@@ -735,14 +585,17 @@ def normalize_phone(title, description="", ad_params=None):
         if len(found_in_body) == 1:
             model_id, m_type, mem_list, query_str = found_in_body[0]
         elif len(found_in_body) > 1:
+            # Берем первую упомянутую модель, если продавец сначала описал свой телефон, а в конце упомянул другие
             model_id, m_type, mem_list, query_str = found_in_body[0]
         else:
+            # Безопасный Fuzzy-поиск с проверкой пустого заголовка и защитой от путаницы Pro/Max/Plus
             if HAS_RAPIDFUZZ and t_title.strip() and not any(re.search(p, t_full) for p in ACCESSORY_GHOST_PATTERNS):
                 choices = {m[0]: m for m in MODELS_WHITELIST if not (m[1] == "apple" and (has_android_in_title or not has_explicit_iphone))}
                 if choices:
                     best = fuzz_process.extractOne(t_title, list(choices.keys()), scorer=fuzz.token_set_ratio, score_cutoff=92)
                     if best:
                         cand_name = best[0].lower()
+                        # Защита: чтобы 'iPhone 13' никогда не сматчился с 'iPhone 13 Pro' через token_set_ratio
                         suffix_words = [("pro", "про"), ("max", "макс"), ("plus", "плюс", "+"), ("ultra", "ультра"), ("mini", "мини"), ("fe", "фе")]
                         mismatch = False
                         for s_group in suffix_words:
@@ -802,9 +655,10 @@ def weighted_median(items):
 
 
 def fetch_onliner_baraholka_prices(phone_info, target_memory):
+    """Тихий фоновый опрос Барахолки Onliner (дополнительный источник хозяйских цен)."""
     prices = []
     q = f"{phone_info['query']} {target_memory}"
-    url = f"[https://baraholka.onliner.by/search.php?q=](https://baraholka.onliner.by/search.php?q=){requests.utils.quote(q)}&cat=1"
+    url = f"https://baraholka.onliner.by/search.php?q={requests.utils.quote(q)}&cat=1"
     try:
         r = session.get(url, headers={"Accept": "text/html"}, timeout=6)
         if r.status_code != 200:
@@ -826,8 +680,7 @@ def fetch_onliner_baraholka_prices(phone_info, target_memory):
             p_str = p_m.group(1).replace(" ", "").replace(",", ".")
             p_val = float(p_str)
             if 130 <= p_val <= 3500:
-                w = 0.45 if norm["is_assumed_mem"] else 0.90
-                prices.append((p_val, w))
+                prices.append((p_val, 0.90))
     except Exception:
         pass
     return prices
@@ -844,7 +697,7 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
 
     for _ in range(2):
         url = (
-            f"[https://api.kufar.by/search-api/v2/search/rendered-paginated](https://api.kufar.by/search-api/v2/search/rendered-paginated)"
+            f"https://api.kufar.by/search-api/v2/search/rendered-paginated"
             f"?cat=17010&cmp=0&lang=ru&prc=r%3A12000%2C350000{rgn_param}"
             f"&query={requests.utils.quote(phone_info['query'])}&size=50&sort=lst.d"
         )
@@ -875,6 +728,8 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
                     norm, _ = normalize_phone(subj, "", ad.get("ad_parameters", []))
                     if not norm or norm["model"] != phone_info["model"] or norm["memory"] != target_memory:
                         continue
+                    if norm["is_assumed_mem"] and len(phone_info["valid_memories"]) > 1:
+                        continue
                     if phone_info["model"] in ("iPhone 11", "iPhone 12", "iPhone 13", "iPhone 14", "iPhone 15") and p_byn < 250:
                         continue
 
@@ -882,14 +737,8 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
                     days_old = max(0.0, (now - list_ts) / 86400.0)
                     days_list.append(days_old)
 
-                    # Плавное затухание веса (-2% за день простоя, пол 0.30)
+                    # Плавное затухание веса (-2% за каждый день простоя, минимальный вес старых лотов 0.30)
                     weight = max(0.30, 1.0 - 0.02 * days_old)
-
-                    # ПУНКТ 3: если память в объявлении не была указана явно (is_assumed_mem=True),
-                    # не выбрасываем лот, а берем в статистику с весом 0.5
-                    if norm["is_assumed_mem"] and len(phone_info["valid_memories"]) > 1:
-                        weight *= 0.5
-
                     weighted_prices.append((p_byn, weight))
 
                     acc_id = str(ad.get("account_id") or "")
@@ -928,7 +777,7 @@ def compute_raw_market_for_mem(phone_info, target_memory, settings):
         w_prices.extend(onl_prices)
 
     n = len(w_prices)
-    if n < MIN_VALID_SAMPLE:
+    if n < 3:
         return None, n, 0, min_lot, resellers_cnt
 
     w_prices.sort(key=lambda x: x[0])
@@ -976,14 +825,14 @@ def get_market_data(phone_info, settings, force_refresh=False):
     is_correlated = False
 
     base_mem = 128 if 128 in valid_mems else valid_mems[0]
-    if target_mem != base_mem or (market_val is None or n < 8):
+    if target_mem != base_mem or (market_val is None or n < 10):
         base_val, base_n, base_days, base_min, base_res = compute_raw_market_for_mem(phone_info, base_mem, settings)
-        if base_val and base_n >= 5:
+        if base_val and base_n >= 6:
             mem_steps = {64: 0, 128: 1, 256: 2, 512: 3, 1024: 4}
             step_diff = mem_steps.get(target_mem, 1) - mem_steps.get(base_mem, 1)
             correlated_val = round(base_val * (1.0 + 0.12 * step_diff))
 
-            if market_val is None or n < MIN_VALID_SAMPLE:
+            if market_val is None or n < 8:
                 market_val = correlated_val
                 n = base_n
                 med_days = base_days
@@ -1074,7 +923,7 @@ def send_telegram(text, photo_url=None, with_sound=False, reply_markup=None):
     for attempt in range(2):
         try:
             if photo_url:
-                url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TG_TOKEN}/sendPhoto"
+                url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
                 payload = {
                     "chat_id": TG_CHAT_ID,
                     "photo": photo_url,
@@ -1092,7 +941,7 @@ def send_telegram(text, photo_url=None, with_sound=False, reply_markup=None):
                     time.sleep(retry_after)
                     continue
 
-            url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TG_TOKEN}/sendMessage"
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
             payload = {
                 "chat_id": TG_CHAT_ID,
                 "text": text,
@@ -1118,7 +967,7 @@ def flush_old_telegram_updates():
     if not TG_TOKEN:
         return 0
     try:
-        url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TG_TOKEN}/getUpdates?offset=-1&timeout=0"
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset=-1&timeout=0"
         r = session.get(url, timeout=4)
         if r.status_code == 200:
             res = r.json().get("result", [])
@@ -1158,7 +1007,7 @@ def get_districts_inline_keyboard(selected_districts):
 def handle_telegram_updates(last_update_id, settings):
     if not TG_TOKEN:
         return last_update_id
-    url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TG_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=0"
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=0"
     try:
         r = session.get(url, timeout=4)
         if r.status_code != 200:
@@ -1184,11 +1033,11 @@ def handle_telegram_updates(last_update_id, settings):
                             settings["districts"].append(d_name)
                     save_settings(settings)
                     active_str = ", ".join(settings["districts"]) if settings["districts"] else "Весь Минск"
-                    edit_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TG_TOKEN}/editMessageText"
+                    edit_url = f"https://api.telegram.org/bot{TG_TOKEN}/editMessageText"
                     session.post(edit_url, data={
                         "chat_id": TG_CHAT_ID,
                         "message_id": cb["message"]["message_id"],
-                        "text": f"🏘 <b>Выбор районов Минска</b>\nАктивно: <b>{active_str}</b>\n<i>(Лоты с выгодой >30 BYN придут из любого района с пометкой)</i>",
+                        "text": f"🏘 <b>Выбор районов Минска</b>\nАктивно: <b>{active_str}</b>\n<i>(Жирные лоты >25% и >80 BYN придут из любого района)</i>",
                         "parse_mode": "HTML",
                         "reply_markup": json.dumps(get_districts_inline_keyboard(settings["districts"]))
                     }, timeout=5)
@@ -1207,7 +1056,7 @@ def handle_telegram_updates(last_update_id, settings):
             if text in ("/start", "/menu", "Меню"):
                 USER_WAIT_STATE["mode"] = None
                 send_telegram(
-                    "🤖 <b>Панель управления Kufar Sniper 3.3</b>\nВыбери действие на клавиатуре ниже:",
+                    "🤖 <b>Панель управления Kufar Sniper 3.2</b>\nВыбери действие на клавиатуре ниже:",
                     reply_markup=get_main_menu_keyboard()
                 )
 
@@ -1228,7 +1077,6 @@ def handle_telegram_updates(last_update_id, settings):
                     f"• Бюджет поиска: <b>{settings['min_price']} – {settings['max_price']} BYN</b>\n"
                     f"• Коэффициент рынка: <b>{settings['bargain_factor']}</b>\n"
                     f"• Порог ЖИРА: <b>{settings['fat_profit_byn']} BYN / {settings['fat_profit_pct']}%</b>\n"
-                    f"• Мин. выгода под осмотр: <b>{settings['inspect_min_profit']} BYN</b>\n"
                     f"• Заданные якоря: <b>{anc_str}</b>\n\n"
                     f"<b>Команды для изменения:</b>\n"
                     f"• <code>цена 150 1200</code> — изменить мин и макс цену\n"
@@ -1324,27 +1172,26 @@ def handle_interactive_price_check(query_text, settings):
     send_telegram(f"⏳ Сканирую рынок Минска, РБ и Onliner для <b>{phone_info['model']} ({phone_info['memory']} GB)</b>...")
     m_data = get_market_data(phone_info, settings, force_refresh=True)
     if not m_data:
-        send_telegram("⚠️ Слишком мало активных объявлений на рынке (меньше 3 шт.) для расчета.")
+        send_telegram("⚠️ Слишком мало активных объявлений на рынке для точного расчета.")
         return
 
     med = m_data["price"]
     fast_buy = round(med * 0.86)
     bargain_buy = round(med * 0.92)
     min_p = m_data["min_price"]
-    min_link = html.escape(m_data["min_link"] or "[https://www.kufar.by](https://www.kufar.by)")
+    min_link = html.escape(m_data["min_link"] or "https://www.kufar.by")
     anc_note = " ⚓ <i>(Зафиксировано твоим якорем)</i>" if m_data.get("is_anchored") else ""
-    low_sample_warn = f"\n⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>" if m_data["sample_size"] < 8 else ""
 
     liq_label = "🔥 Высокая (улетают быстро)" if m_data["median_days"] <= 3.5 else ("⏳ Средняя" if m_data["median_days"] <= 8 else "🐌 Низкая (висят долго)")
 
     resp = (
-        f"📊 <b>Аналитика: {phone_info['model']} ({phone_info['memory']} GB)</b>{low_sample_warn}\n\n"
+        f"📊 <b>Аналитика: {phone_info['model']} ({phone_info['memory']} GB)</b>\n\n"
         f"• 💎 <b>Реальная рыночная цена: ~{med:.0f} BYN</b>{anc_note}\n"
         f"• 🚀 Цена быстрого выкупа (жир): <b>до {fast_buy} BYN</b>\n"
         f"• 🤝 Рабочая цена под перепродажу: <b>~{bargain_buy} BYN</b>\n"
         f"• 📉 Минимум на Куфаре сейчас: <a href='{min_link}'><b>{min_p:.0f} BYN (открыть)</b></a>\n\n"
         f"⏱ Индекс ликвидности: <b>{liq_label}</b> (медиана жизни: ~{m_data['median_days']} дн.)\n"
-        f"📦 Лотов в выборке: <b>{m_data['sample_size']} шт.</b> (перекупов на модели: ~{m_data['resellers_count']})"
+        f"📦 Чистых лотов в выборке: <b>{m_data['sample_size']} шт.</b> (перекупов на модели: ~{m_data['resellers_count']})"
     )
 
     if user_test_price:
@@ -1401,7 +1248,7 @@ def send_top_resellers():
         return
     msg = "🦈 <b>Топ активных перекупов на Куфаре:</b>\n\n"
     for i, r in enumerate(rows, 1):
-        link = html.escape(r["last_link"] or "[https://www.kufar.by](https://www.kufar.by)")
+        link = html.escape(r["last_link"] or "https://www.kufar.by")
         msg += f"{i}. ID <code>{r['account_id']}</code> — замечено лотов: <b>{r['ads_count']} шт.</b> (последний: <a href='{link}'>{html.escape(r['last_model'] or 'Телефон')}</a>)\n"
     send_telegram(msg)
 
@@ -1421,7 +1268,7 @@ def check_graveyard_and_digest(settings):
 
     for row in stale_rows:
         ad_id = row["ad_id"]
-        url = f"[https://api.kufar.by/search-api/v2/item/](https://api.kufar.by/search-api/v2/item/){ad_id}/rendered?lang=ru"
+        url = f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru"
         try:
             r = session.get(url, timeout=5)
             if r.status_code == 404 or (r.status_code == 200 and not r.json().get("result")):
@@ -1465,7 +1312,7 @@ def check_graveyard_and_digest(settings):
             msg = "🎯 <b>Вечерний радар «Дожим висяков» (висят 5–10 дней):</b>\n<i>Продавцы уже созрели для хорошего торга в ЛС!</i>\n\n"
             for h in hangers:
                 d_cnt = round((now - h["list_time_ts"]) / 86400.0, 1)
-                link = f"[https://www.kufar.by/item/](https://www.kufar.by/item/){h['ad_id']}"
+                link = f"https://www.kufar.by/item/{h['ad_id']}"
                 msg += f"• <a href='{link}'><b>{h['model']} ({h['memory']}GB)</b></a> — {h['last_seen_price']:.0f} BYN (висит {d_cnt} дн.)\n"
             send_telegram(msg, with_sound=False)
 
@@ -1475,7 +1322,7 @@ def get_latest_ads(settings):
     min_k = int(settings.get("min_price", 120)) * 100
     max_k = int(settings.get("max_price", 1500)) * 100
     url = (
-        f"[https://api.kufar.by/search-api/v2/search/rendered-paginated](https://api.kufar.by/search-api/v2/search/rendered-paginated)"
+        f"https://api.kufar.by/search-api/v2/search/rendered-paginated"
         f"?cat=17010&cmp=0&lang=ru&prc=r%3A{min_k}%2C{max_k}&rgn=7&size=25&sort=lst.d"
     )
     try:
@@ -1490,7 +1337,7 @@ def get_latest_ads(settings):
 
 
 def get_ad_description(ad_id):
-    url = f"[https://api.kufar.by/search-api/v2/item/](https://api.kufar.by/search-api/v2/item/){ad_id}/rendered?lang=ru"
+    url = f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru"
     try:
         r = session.get(url, timeout=6)
         if r.status_code == 200:
@@ -1534,17 +1381,18 @@ def main():
                 """, (ad_id, str(ad.get("account_id") or ""), p_byn, p_byn, now_ts, now_ts, list_ts))
         db_conn.commit()
         send_telegram(
-            f"🚀 <b>Kufar Sniper 3.3 запущен!</b>\n"
-            f"⚡ Отклик кнопок: <b>1 сек.</b> | Воронка расширена\n"
+            f"🚀 <b>Kufar Sniper 3.2 запущен!</b>\n"
+            f"⚡ Отклик кнопок: <b>1 сек.</b>\n"
             f"📦 Стартовая лента ({len(initial_ads)} лотов) записана в базу.",
             with_sound=False,
             reply_markup=get_main_menu_keyboard()
         )
 
-    print("🚀 Мониторинг Kufar 3.3 активен.")
+    print("🚀 Мониторинг Kufar 3.2 активен (Быстрый отклик Telegram включен).")
     next_kufar_scan_ts = 0.0
 
     while (time.time() - start_time) < max_seconds:
+        # 1. Мгновенный опрос кнопок Telegram (каждую 1 секунду)
         last_update_id = handle_telegram_updates(last_update_id, settings)
 
         now_f = time.time()
@@ -1554,8 +1402,10 @@ def main():
 
         next_kufar_scan_ts = now_f + random.uniform(MIN_INTERVAL, MAX_INTERVAL)
 
+        # 2. Фоновая проверка проданных лотов и вечернего дайджеста
         check_graveyard_and_digest(settings)
 
+        # 3. Опрос свежей ленты Куфара
         ads = get_latest_ads(settings)
         now_ts = int(time.time())
 
@@ -1613,6 +1463,7 @@ def main():
 
             raw_title = ad.get("subject", "Без названия")
 
+            # Быстрая проверка только явных браков в заголовке (сперва узнаем, распознается ли модель в заголовке)
             title_norm, _ = normalize_phone(raw_title, "", ad.get("ad_parameters", []))
             title_model_id = title_norm["model"] if title_norm else None
             title_phone_type = title_norm["type"] if title_norm else "apple"
@@ -1651,7 +1502,7 @@ def main():
             color_name, color_tier = extract_color(full_text)
             has_box = check_missing_box(full_text)
             district = parse_district(ad)
-            link = ad.get("ad_link", f"[https://www.kufar.by/item/](https://www.kufar.by/item/){ad_id}")
+            link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
 
             seller_ads_cnt = 1
             if account_id:
@@ -1683,7 +1534,7 @@ def main():
 
             m_data = get_market_data(phone_info, settings)
             if not m_data:
-                print(f"🔇 [Мало данных даже после расширения: n < {MIN_VALID_SAMPLE}] {phone_info['key']}")
+                print(f"🔇 [Пропуск редкой/неликвидной модели] {phone_info['key']}")
                 continue
 
             base_market = m_data["price"]
@@ -1694,18 +1545,17 @@ def main():
             profit_byn = adj_market - price_byn
             profit_pct = (profit_byn / adj_market) * 100.0 if adj_market > 0 else 0.0
 
-            # ПУНКТ 4: Смягченный фильтр районов (пропускаем чужой район, если выгода > 30 BYN)
             selected_dists = settings.get("districts", [])
             outside_district_tag = ""
             if selected_dists:
                 in_selected = any(d.lower() in district.lower() for d in selected_dists)
                 if not in_selected:
-                    if profit_byn > 30:
-                        outside_district_tag = "📍 <b>Вне твоего района</b>\n"
+                    if profit_byn >= 80 and profit_pct >= 25:
+                        outside_district_tag = "🚀 <b>ЖИР ВНЕ ТВОЕГО РАЙОНА!</b>\n"
                     else:
                         cur.execute("UPDATE lot_history SET notified = 1 WHERE ad_id = ?", (ad_id,))
                         db_conn.commit()
-                        print(f"🗺 [Пропуск по району: {district}, выгода {profit_byn:+.0f} <= 30] {phone_info['key']}")
+                        print(f"🗺 [Пропуск по району: {district}] {phone_info['key']}")
                         continue
 
             matched_urgent = []
@@ -1715,7 +1565,7 @@ def main():
                     matched_urgent.append(m_u.group(0))
             is_urgent = len(matched_urgent) > 0
 
-            # ЗВУК ТОЛЬКО НА ЧЕСТНЫЙ ЖИР!
+            # ЗВУК ТОЛЬКО НА ЧЕСТНЫЙ ЖИР! Аномально дешевое (>50% ниже рынка) идет без звука.
             is_scam_suspect = profit_pct >= 50.0
             with_sound = False
 
@@ -1728,7 +1578,7 @@ def main():
             elif profit_byn >= settings["work_profit_byn"]:
                 tier_header = "🟢 <b>РАБОЧИЙ ВАРИАНТ (Хорошая маржа)</b>"
                 with_sound = False
-            elif profit_byn >= settings.get("inspect_min_profit", 15) and not has_defects:
+            elif profit_byn >= settings["inspect_min_profit"] and not has_defects:
                 tier_header = "👀 <b>ПОД ОСМОТР (Чистый лот в плюсе)</b>"
                 with_sound = False
             else:
@@ -1742,10 +1592,6 @@ def main():
                 tags.append(f"🦈 <b>Перекуп</b> ({seller_ads_cnt} лотов в базе)")
             else:
                 tags.append("👤 Частник")
-
-            # ПУНКТ 2: Предупреждение, если чистая выборка меньше 8 объявлений
-            if m_data["sample_size"] < 8:
-                tags.append(f"⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>")
 
             if days_old >= 14 and "торг" in clean_text(full_text):
                 tags.append(f"💤 <b>Висяк ({days_old:.0f} дн. + торг)</b>")
@@ -1763,7 +1609,7 @@ def main():
             if phone_info["is_assumed_mem"]:
                 tags.append(f"ℹ️ Память по низу ({phone_info['memory']}GB)")
 
-            photo_url = f"[https://rms.kufar.by/v1/gallery/](https://rms.kufar.by/v1/gallery/){images[0]['path']}" if (images and "path" in images[0]) else None
+            photo_url = f"https://rms.kufar.by/v1/gallery/{images[0]['path']}" if (images and "path" in images[0]) else None
 
             safe_title = html.escape(raw_title)
             safe_link = html.escape(link)
