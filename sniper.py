@@ -372,7 +372,7 @@ def init_db():
     except Exception:
         pass
 
-   cur.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS sellers (
             account_id TEXT PRIMARY KEY,
             ads_count INTEGER DEFAULT 1,
