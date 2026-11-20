@@ -30,7 +30,8 @@ SETTINGS_FILE = "settings.json"
 TG_POLL_INTERVAL = 1.0              # Опрос кнопок Telegram каждую 1 секунду 24/7
 GRAVEYARD_CHECK_INTERVAL = 300.0    # Проверка удаленных/проданных лотов раз в 5 минут
 SELLER_CACHE_TTL = 2 * 3600         # Кэш проверки профиля продавца — 2 часа
-MARKET_CACHE_TTL = 4 * 3600         # Кэш рынка живет 4 часа
+MARKET_CACHE_TTL = 4 * 3600         # Кэш витринного рынка живет 4 часа
+SOLD_LOOKBACK_DAYS = 30             # Глубина истории продаж для онлайн-калибровки
 MIN_VALID_SAMPLE = 3                # Минимальная выборка (при <8 ставится предупреждающий тег)
 
 MINSK_DISTRICTS = [
@@ -41,7 +42,7 @@ MINSK_DISTRICTS = [
 DEFAULT_SETTINGS = {
     "min_price": 120,
     "max_price": 2800,
-    "bargain_factor": 1.00,       # Коэффициент к очищенной взвешенной медиане
+    "bargain_factor": 1.00,       # Коэффициент к рынку
     "districts": [],              # Пустой список = весь Минск
     "anchors": {},                # Ручные якоря цен: {"iPhone 13_128GB": 650}
     "fat_profit_byn": 85,         # Выгода для ЖИРА (со звуком)
@@ -52,7 +53,6 @@ DEFAULT_SETTINGS = {
     "last_digest_date": ""
 }
 
-# Глобальное состояние ожидания ввода от пользователя в Telegram
 USER_WAIT_STATE = {"mode": None}
 
 # ================= 1. РАСШИРЕННЫЙ БЕЛЫЙ СПИСОК МОДЕЛЕЙ =================
@@ -61,7 +61,6 @@ PLUS_MOD = r"(?:\+(?!\w)|(?:plus|плюс)\b)"
 NO_UNIT_AFTER = r"(?!\s*(?:дн|дня|дней|мес|лет|год|р\b|руб|byn|%|шт|гб|gb|мп|mp|вт|w\b|мкр|дом|кв))"
 NO_SUFFIX = rf"(?!{SEP}(?:\+(?!\w)|(?:pro|про|max|макс|mini|мини|plus|плюс|ultra|ультра|fe|фе|lite|лайт|t|т|e|е|xl|хл|a|а|s|с)\b)){NO_UNIT_AFTER}"
 
-# Безопасный мост между словом iPhone/Apple и номером модели (без цифр и названий других моделей/iOS!)
 BRIDGE_STOP = r"(?:iphone|айфон|apple|эпл|ios|айос|pro|про|max|макс|mini|мини|plus|плюс|xs|хс|xr|хр|se|гб|gb)"
 IPHONE_BRIDGE = rf"(?:{SEP}|\s+(?:(?!{BRIDGE_STOP}\b)[а-яa-z]+\s+){{0,2}})(?<!ios\s)(?<!айос\s)"
 
@@ -202,7 +201,6 @@ ACCESSORY_GHOST_PATTERNS = [
 
 BUY_INTENT_TITLE_START = r"^\s*(?:куплю|ищу|сниму|возьму)\b"
 
-# Жесткий бан за 100% АКБ только для старых серий (XR, XS, SE, 11, 12), если в тексте не указана замена АКБ.
 OLD_APPLE_100_BAT_MODELS = {
     "iPhone XR", "iPhone XS", "iPhone XS Max",
     "iPhone SE 2020", "iPhone SE 2022",
@@ -211,7 +209,6 @@ OLD_APPLE_100_BAT_MODELS = {
 }
 
 # ================= 2. ВЫВЕРЕННЫЕ МАРКЕРЫ БАНА И ШТРАФОВ =================
-# Безопасные бытовые фразы, которые вырезаются перед проверкой на бан (чтобы не банить 'защитное стекло под замену' или 'копия чека')
 HARMLESS_PHRASES_REGEX = re.compile(
     r"\b(?:защитн\w*\s+стекл\w*|бронестекл\w*|гидрогел\w*|пленк\w*|чехол\w*|чехл\w*|кабел\w*|провод\w*|ремеш\w*)\s+(?:под\s+замену|тресну\w*|разби\w*|копия|реплика)\b"
     r"|\b(?:под\s+замену)\s+(?:защитн\w*\s+стекл\w*|бронестекл\w*|гидрогел\w*|пленк\w*|чехол\w*)\b"
@@ -245,7 +242,6 @@ NEGATABLE_DEAD_MARKERS = [
     "трейд ин", "trade in"
 ]
 
-# Замена АКБ перенесена из бана в дисконт (-7%), в бане оставлены только замена экрана, рефы и блокировки
 REPAIR_MARKERS = [
     "менялся экран", "экран менялся", "замена экрана",
     "дисплей менялся", "менялся дисплей", "замена дисплея",
@@ -371,7 +367,6 @@ def init_db():
             updated_ts INTEGER
         )
     """)
-    # Безопасная миграция для существующих БД из прошлых версий
     try:
         cur.execute("ALTER TABLE market_cache ADD COLUMN is_correlated INTEGER DEFAULT 0")
     except Exception:
@@ -397,6 +392,7 @@ def close_db():
     try:
         if db_conn:
             db_conn.commit()
+            db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             db_conn.close()
     except Exception:
         pass
@@ -412,13 +408,20 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 
 
 def calculate_estimated_sold_price(last_price, days_on_market):
-    if days_on_market <= 2:
-        return round(last_price * 0.98)
-    elif days_on_market <= 7:
-        return round(last_price * 0.94)
-    elif days_on_market <= 14:
+    """
+    Реалистичные скидки на торг при реальной сделке:
+    - Выкуп день в день (<= 1.0 дн.): 95% (торг минимален)
+    - 1–3 дня: 90%
+    - 3–7 дней: 80%
+    - 7–14 дней: 75%
+    """
+    if days_on_market <= 1.0:
+        return round(last_price * 0.95)
+    elif days_on_market <= 3.0:
         return round(last_price * 0.90)
-    return round(last_price * 0.85)
+    elif days_on_market <= 7.0:
+        return round(last_price * 0.80)
+    return round(last_price * 0.75)
 
 
 # ================= ТЕКСТОВЫЕ АНАЛИЗАТОРЫ И ФИЛЬТРЫ =================
@@ -433,7 +436,6 @@ def clean_text(text):
 
 
 def strip_harmless_phrases(text):
-    """Удаляет безопасные бытовые словосочетания ('защитное стекло под замену', 'копия чека') перед проверкой на бан."""
     return HARMLESS_PHRASES_REGEX.sub(" ", clean_text(text))
 
 
@@ -442,7 +444,6 @@ def has_direct_marker(text, marker):
     return bool(re.search(rf"\b{re.escape(marker)}\b", t))
 
 
-# Фразы с 'нет / не', которые не относятся к состоянию телефона и не должны отменять бан следующего за ними дефекта
 IRRELEVANT_NEGATIONS_REGEX = re.compile(
     r"\b(?:торга|обмена|бартера|коробки|комплекта|зарядки|блока|кабеля|чехла|наушников|доставки|пересыла|спешки|времени)\s+нет\b"
     r"|\bнет\s+(?:торга|обмена|бартера|коробки|комплекта|зарядки|чехла|наушников|времени|смысла)\b"
@@ -451,10 +452,6 @@ IRRELEVANT_NEGATIONS_REGEX = re.compile(
 
 
 def has_marker_without_negation(text, marker):
-    """
-    Точный поиск маркера с границами слов \b...\b и проверкой окна 50 символов назад.
-    Защищено от ложных отмен бана на фразах 'Торга нет, разбит экран' и 'Не вскрывался, но трещина'.
-    """
     t = strip_harmless_phrases(text)
     neg_pattern = r"\b(?:без|не|нет|никаких|никакого|никакой|отсутствуют|отсутствует|ничего\s+не|нужно\s+без)\b"
     after_neg_pattern = r"^\s*(?:не\s+было|нет|не\s+обнаружено|не\s+имеет|отсутствуют|отсутствует|не\s+менял\w*)\b"
@@ -464,11 +461,8 @@ def has_marker_without_negation(text, marker):
         end_idx = m.end()
 
         prefix = t[max(0, start_idx - 50):start_idx]
-        # 1. Режем по концу предложения (. ! ? \n)
         clause = re.split(r"[.!?\n]", prefix)[-1]
-        # 2. Режем по противительным союзам (', но', ', а', ', однако', ', зато', ', только')
         clause = re.split(r",\s*(?:но|а|однако|зато|правда|только)\b", clause)[-1]
-        # 3. Убираем бытовые отрицания ('торга нет', 'обмена нет', 'не спешу')
         clause = IRRELEVANT_NEGATIONS_REGEX.sub(" ", clause)
 
         if re.search(neg_pattern, clause):
@@ -559,7 +553,6 @@ def check_ban_markers(title, description, phone_type="apple", model_id=None, ad_
     if has_marker_without_negation(full, "заблокирован") or has_marker_without_negation(full, "на пароле"):
         return "Заблокирован / На пароле"
 
-    # На старых iPhone (XR - 12) баним подозрительные 100% АКБ только если продавец не указал честно замену батареи
     if phone_type == "apple" and model_id in OLD_APPLE_100_BAT_MODELS:
         if re.search(r"\b(?:акб|батаре[яиюей]|емкость|состояние\s*акб)[\s:=-]*100\s*%", full):
             has_honest_bat_replace = any(has_marker_without_negation(full, bm) for bm in BATTERY_REPLACED_MARKERS)
@@ -608,10 +601,6 @@ def check_missing_box(text):
 
 
 def strip_secondary_device_mentions(text):
-    """
-    Вырезает упоминания вторичных устройств ('купил новый iPhone 15 Pro на 256 гб', 'обмен на S23 Ultra'),
-    поддерживая буквенно-цифровые модели (S23, A54, X6, F6, XR, XS, SE, 16e).
-    """
     pattern = (
         r"\b(?:купил\w*|переш(?:ел|ла|ли)\s+на|обмен\s+на|обменяю\s+на|подарили|взял\s+себе|чехол\s+(?:от|на|для))\s+"
         r"(?:[а-яa-z]+\s+){0,2}"
@@ -626,7 +615,7 @@ def strip_secondary_device_mentions(text):
 def extract_memory(title, description, ad_params, valid_memories):
     sorted_mems = sorted(valid_memories, reverse=True)
 
-    # 1. Структурированные параметры Куфара (высший приоритет)
+    # 1. Параметры Куфара
     if ad_params:
         for p in ad_params:
             if p.get("p") in ("phablet_phones_memory", "mobile_phones_memory", "memory"):
@@ -640,7 +629,7 @@ def extract_memory(title, description, ad_params, valid_memories):
 
     t_title = clean_text(title)
 
-    # 2. Полная проверка ЗАГОЛОВКА по всем правилам (1TB -> 8/256 -> 256 гб -> голое число 256)
+    # 2. Полная проверка ЗАГОЛОВКА
     if 1024 in valid_memories and re.search(r"\b(?:1024|1\s*(?:tb|тб|терабайт))\b", t_title):
         return 1024, False
 
@@ -657,7 +646,7 @@ def extract_memory(title, description, ad_params, valid_memories):
         if re.search(pattern, t_title):
             return mem, False
 
-    # 3. Если в заголовке памяти нет — проверяем ОПИСАНИЕ (очищенное от вторичных упоминаний) только по явным маркерам гб/gb
+    # 3. ОПИСАНИЕ (только явные гб/gb или 8/256)
     t_desc = strip_secondary_device_mentions(clean_text(description))
 
     if 1024 in valid_memories and re.search(r"\b(?:1024|1\s*(?:tb|тб|терабайт))\b", t_desc):
@@ -671,7 +660,6 @@ def extract_memory(title, description, ad_params, valid_memories):
         if re.search(rf"\b{mem}\s*(?:гб|gb|гиг|г\b|g\b)|\bна\s*{mem}\b", t_desc):
             return mem, False
 
-    # 4. Если нигде не найдено — младшая память с флагом is_assumed_mem = True
     return valid_memories[0], True
 
 
@@ -808,14 +796,12 @@ def get_seller_active_phones_count(account_id, model_key, ad_link, now_ts, is_ne
     cur.execute("SELECT ads_count, last_seen_ts FROM sellers WHERE account_id = ?", (account_id,))
     row = cur.fetchone()
 
-    # Считаем активные телефоны этого продавца в нашей собственной базе lot_history
     cur.execute("""
         SELECT COUNT(*) as c FROM lot_history
         WHERE account_id = ? AND status = 'active' AND model IS NOT NULL
     """, (account_id,))
     db_active_cnt = cur.fetchone()["c"] or 1
 
-    # Если продавец уже кэширован как перекуп (>=2) или проверялся недавно и это не второй новый лот
     if row and (now_ts - (row["last_seen_ts"] or 0)) < SELLER_CACHE_TTL:
         cached_cnt = max(row["ads_count"] or 1, db_active_cnt)
         if not (is_new_ad and cached_cnt < 2 and (now_ts - (row["last_seen_ts"] or 0)) > 180):
@@ -860,7 +846,7 @@ def get_seller_active_phones_count(account_id, model_key, ad_link, now_ts, is_ne
     return api_phones_cnt
 
 
-# ================= 3. ПРОДВИНУТАЯ МАТЕМАТИКА РЫНКА (+ ONLINER + ЯКОРЯ) =================
+# ================= 3. ПРОДВИНУТАЯ МАТЕМАТИКА РЫНКА (+ ОНЛАЙН-КАЛИБРОВКА ПО ПРОДАЖАМ) =================
 def parse_kufar_time(iso_str):
     if not iso_str:
         return time.time()
@@ -887,43 +873,75 @@ def weighted_median(items):
     return items_sorted[-1][0]
 
 
-def fetch_onliner_baraholka_prices(phone_info, target_memory):
-    prices = []
-    q = f"{phone_info['query']} {target_memory}"
-    url = f"https://baraholka.onliner.by/search.php?q={requests.utils.quote(q)}&cat=1"
-    try:
-        r = session.get(url, headers={"Accept": "text/html"}, timeout=6)
-        if r.status_code != 200:
-            return []
-        blocks = re.findall(r'<td class="txt-wb">.*?</tr>', r.text, re.DOTALL)
-        for b in blocks[:20]:
-            t_m = re.search(r'class="wraptxt"[^>]*>(.*?)</a>', b, re.DOTALL)
-            p_m = re.search(r'class="price-primary"[^>]*>\s*([\d\s,\.]+)\s*р', b)
-            if not t_m or not p_m:
-                continue
-            title_raw = re.sub(r"<[^>]+>", "", t_m.group(1)).strip()
-            if "куплю" in title_raw.lower() or "обмен" in title_raw.lower():
-                continue
-            if check_ban_markers(title_raw, "", phone_info["type"], phone_info["model"]):
-                continue
-            norm, _ = normalize_phone(title_raw, "")
-            if not norm or norm["model"] != phone_info["model"] or norm["memory"] != target_memory:
-                continue
-            p_str = p_m.group(1).replace(" ", "").replace(",", ".")
-            p_val = float(p_str)
-            if 130 <= p_val <= 5000:
-                w = 0.45 if norm["is_assumed_mem"] else 0.90
-                prices.append((p_val, w))
-    except Exception:
-        pass
-    return prices
+def get_sold_market_stats(model, memory):
+    """
+    Онлайн-статистика реальных продаж (sold_fast + sold) из SQLite за последние 30 дней.
+    Выкупы день в день (sold_fast) получают двойной приоритет (вес 2.0x).
+    Убитые АКБ (<80%) исключены, чтобы не занижать чистый эталонный рынок.
+    """
+    now = int(time.time())
+    cutoff = now - SOLD_LOOKBACK_DAYS * 86400
+    cur = db_conn.cursor()
+    cur.execute("""
+        SELECT status, estimated_sold_price, last_seen_ts, days_on_market
+        FROM lot_history
+        WHERE model = ? AND memory = ?
+          AND status IN ('sold_fast', 'sold')
+          AND estimated_sold_price IS NOT NULL AND estimated_sold_price > 0
+          AND (battery_health IS NULL OR battery_health >= 80)
+          AND last_seen_ts >= ?
+    """, (model, memory, cutoff))
+    rows = cur.fetchall()
+    if not rows:
+        return None, 0, 0
+
+    weighted_sales = []
+    fast_cnt = 0
+    for r in rows:
+        age_days = max(0.0, (now - (r["last_seen_ts"] or now)) / 86400.0)
+        w = max(0.40, 1.0 - 0.02 * age_days)
+        if r["status"] == "sold_fast" or (r["days_on_market"] is not None and r["days_on_market"] <= 1.0):
+            w *= 2.0
+            fast_cnt += 1
+        weighted_sales.append((r["estimated_sold_price"], w))
+
+    sold_med = round(weighted_median(weighted_sales))
+    return sold_med, len(rows), fast_cnt
+
+
+def blend_with_sold_history(showcase_price, sold_med, sold_cnt, fast_cnt):
+    """
+    Смешивает витринную цену (5%/35%) с реальными продажами в реальном времени.
+    Возвращает (blended_price, sold_weight_pct).
+    """
+    if sold_med is None or sold_cnt == 0:
+        return showcase_price, 0
+
+    if fast_cnt >= 5 or sold_cnt >= 15:
+        alpha = 0.85
+    elif fast_cnt >= 3 or sold_cnt >= 6:
+        alpha = 0.60
+    elif fast_cnt >= 2 or sold_cnt >= 3:
+        alpha = 0.35
+    else:
+        alpha = 0.0
+
+    if showcase_price is None:
+        if sold_cnt >= MIN_VALID_SAMPLE:
+            return sold_med, 100
+        return None, 0
+
+    if alpha == 0.0:
+        return showcase_price, 0
+
+    blended = round(sold_med * alpha + showcase_price * (1.0 - alpha))
+    return blended, int(round(alpha * 100))
 
 
 def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
     """
-    Двухэтапный сбор выборки Куфара:
-    Сначала делает целевой запрос с объемом памяти (чтобы 256/512GB не тонули в выдаче 128GB),
-    а затем добирает общую выдачу модели (для объявлений, где память указана только в параметрах).
+    Сбор витринной выборки строго с Куфара (без Onliner и без 'срочно').
+    Сначала точечный запрос с объемом памяти, затем добор общей выдачи модели.
     """
     weighted_prices = []
     days_list = []
@@ -937,7 +955,6 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
     queries_to_run = [mem_query, phone_info["query"]] if len(phone_info["valid_memories"]) > 1 else [phone_info["query"]]
 
     for q_idx, q_str in enumerate(queries_to_run):
-        # Если после прицельного запроса с памятью уже набралось >= 22 чистых лотов — второй запрос не нужен
         if q_idx == 1 and len(weighted_prices) >= 22:
             break
 
@@ -1020,7 +1037,9 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
 
 
 def compute_raw_market_for_mem(phone_info, target_memory):
-    """Возвращает чистую взвешенную медиану (без bargain_factor), чтобы кэш не зависел от смены коэффициента."""
+    """
+    Витринная медиана Куфара: отсечение 5% снизу (мин. 1 лот при n>=7) и 35% сверху.
+    """
     w_prices, days_list, min_lot, resellers_cnt = fetch_kufar_sample(phone_info, target_memory, region_minsk=True)
 
     if len(w_prices) < 15:
@@ -1028,17 +1047,13 @@ def compute_raw_market_for_mem(phone_info, target_memory):
         if len(rb_w) > len(w_prices):
             w_prices, days_list, min_lot, resellers_cnt = rb_w, rb_days, rb_min, rb_res
 
-    onl_prices = fetch_onliner_baraholka_prices(phone_info, target_memory)
-    if onl_prices:
-        w_prices.extend(onl_prices)
-
     n = len(w_prices)
     if n < MIN_VALID_SAMPLE:
         return None, n, 0, min_lot, resellers_cnt
 
     w_prices.sort(key=lambda x: x[0])
     if n >= 7:
-        cut_low = max(1, int(n * 0.20))
+        cut_low = max(1, int(n * 0.05))
         cut_high = max(1, int(n * 0.35))
         core = w_prices[cut_low: n - cut_high]
         if not core:
@@ -1058,15 +1073,26 @@ def get_market_data(phone_info, settings, force_refresh=False):
 
     anchor_val = settings.get("anchors", {}).get(cache_key)
     bf = settings.get("bargain_factor", 1.00)
+    target_mem = phone_info["memory"]
+
+    # В реальном времени забираем свежую статистику реальных продаж из SQLite
+    sold_med, sold_cnt, fast_cnt = get_sold_market_stats(phone_info["model"], target_mem)
 
     if not force_refresh:
         cur.execute("SELECT * FROM market_cache WHERE cache_key = ?", (cache_key,))
         row = cur.fetchone()
         if row and (now - row["updated_ts"]) < MARKET_CACHE_TTL:
-            scaled_market = round(row["market_price"] * bf)
+            showcase_price = row["market_price"]
+            blended_raw, sold_weight_pct = blend_with_sold_history(showcase_price, sold_med, sold_cnt, fast_cnt)
+            scaled_market = round(blended_raw * bf)
             p = anchor_val if anchor_val else scaled_market
             return {
                 "price": p,
+                "showcase_price": showcase_price,
+                "sold_median": sold_med,
+                "sold_count": sold_cnt,
+                "fast_sold_count": fast_cnt,
+                "sold_weight_pct": sold_weight_pct,
                 "min_price": row["min_price"],
                 "min_link": row["min_link"],
                 "sample_size": row["sample_size"],
@@ -1076,7 +1102,6 @@ def get_market_data(phone_info, settings, force_refresh=False):
                 "is_anchored": bool(anchor_val)
             }
 
-    target_mem = phone_info["memory"]
     valid_mems = phone_info["valid_memories"]
     raw_market_val, n, med_days, min_lot, resellers_cnt = compute_raw_market_for_mem(phone_info, target_mem)
     is_correlated = False
@@ -1119,12 +1144,16 @@ def get_market_data(phone_info, settings, force_refresh=False):
                 raw_market_val = correlated_val
                 is_correlated = True
 
-    if raw_market_val is None and not anchor_val:
-        return None
-    if raw_market_val is None and anchor_val:
-        raw_market_val = anchor_val
+    blended_raw, sold_weight_pct = blend_with_sold_history(raw_market_val, sold_med, sold_cnt, fast_cnt)
 
-    if n < MIN_VALID_SAMPLE and not anchor_val:
+    if blended_raw is None and not anchor_val:
+        return None
+    if raw_market_val is None:
+        raw_market_val = blended_raw if blended_raw else anchor_val
+    if blended_raw is None:
+        blended_raw = anchor_val
+
+    if n < MIN_VALID_SAMPLE and sold_cnt < MIN_VALID_SAMPLE and not anchor_val:
         return None
 
     cur.execute("""
@@ -1134,10 +1163,15 @@ def get_market_data(phone_info, settings, force_refresh=False):
     """, (cache_key, raw_market_val, min_lot[0] if min_lot[0] < 9999 else raw_market_val, min_lot[1], n, med_days, resellers_cnt, 1 if is_correlated else 0, now))
     db_conn.commit()
 
-    scaled_price = round(raw_market_val * bf)
+    scaled_price = round(blended_raw * bf)
     final_price = anchor_val if anchor_val else scaled_price
     return {
         "price": final_price,
+        "showcase_price": raw_market_val,
+        "sold_median": sold_med,
+        "sold_count": sold_cnt,
+        "fast_sold_count": fast_cnt,
+        "sold_weight_pct": sold_weight_pct,
         "min_price": min_lot[0] if min_lot[0] < 9999 else final_price,
         "min_link": min_lot[1],
         "sample_size": n,
@@ -1153,7 +1187,6 @@ def adjust_lot_market_price(base_market, full_text, phone_type, bat_health, colo
     notes = []
     has_defects = False
 
-    # Проверка на замененный аккумулятор (-7% вместо вечного бана)
     bat_replaced_hit = next((bm for bm in BATTERY_REPLACED_MARKERS if has_marker_without_negation(full_text, bm)), None)
     if bat_replaced_hit:
         multiplier -= 0.07
@@ -1201,7 +1234,7 @@ def adjust_lot_market_price(base_market, full_text, phone_type, bat_health, colo
     return adj_price, note_str, has_defects
 
 
-# ================= 4. TELEGRAM API И БЫСТРЫЙ ИНТЕРФЕЙС КНОПОК (UI) =================
+# ================= 4. TELEGRAM API, ИНТЕРФЕЙС И КРАСИВЫЙ ОТЧЕТ ПО БАЗЕ (/db) =================
 def send_telegram(text, photo_url=None, with_sound=False, reply_markup=None):
     if not TG_TOKEN:
         print("⚠️ TG_TOKEN не задан!")
@@ -1253,6 +1286,24 @@ def send_telegram(text, photo_url=None, with_sound=False, reply_markup=None):
     return False
 
 
+def send_telegram_document(file_path, caption=""):
+    if not TG_TOKEN or not os.path.exists(file_path):
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
+        with open(file_path, "rb") as f:
+            r = session.post(
+                url,
+                data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+                files={"document": (os.path.basename(file_path), f)},
+                timeout=30
+            )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"⚠️ Ошибка отправки файла {file_path}: {e}")
+        return False
+
+
 def flush_old_telegram_updates():
     if not TG_TOKEN:
         return 0
@@ -1273,7 +1324,7 @@ def get_main_menu_keyboard():
         "keyboard": [
             [{"text": "📊 Оценка / Тест-драйв"}, {"text": "📈 Отчет за сегодня"}],
             [{"text": "🏘 Районы Минска"}, {"text": "⚙️ Настройки / Якоря"}],
-            [{"text": "🦈 Топ перекупов"}]
+            [{"text": "📦 База / Стата"}, {"text": "🦈 Топ перекупов"}]
         ],
         "resize_keyboard": True
     }
@@ -1292,6 +1343,273 @@ def get_districts_inline_keyboard(selected_districts):
         rows.append(temp_row)
     rows.append([{"text": "🌍 Весь Минск (Сбросить фильтр)", "callback_data": "dist:CLEAR"}])
     return {"inline_keyboard": rows}
+
+
+def generate_html_db_report(settings):
+    """Генерирует красивый интерактивный HTML-отчет по базе (открывается на телефоне и ПК)."""
+    cur = db_conn.cursor()
+
+    cur.execute("SELECT status, COUNT(*) as c FROM lot_history GROUP BY status")
+    status_counts = {r["status"]: r["c"] for r in cur.fetchall()}
+    total_lots = sum(status_counts.values())
+    active_cnt = status_counts.get("active", 0)
+    sold_fast_cnt = status_counts.get("sold_fast", 0)
+    sold_norm_cnt = status_counts.get("sold", 0)
+    removed_cnt = status_counts.get("removed_overpriced", 0) + status_counts.get("removed_mistake", 0)
+    banned_cnt = status_counts.get("banned", 0)
+
+    cur.execute("SELECT COUNT(*) as c FROM sellers WHERE ads_count >= 2")
+    resellers_total = cur.fetchone()["c"]
+
+    # Сводка по моделям (из market_cache + актуальные продажи)
+    cur.execute("SELECT * FROM market_cache ORDER BY updated_ts DESC")
+    cache_rows = cur.fetchall()
+    model_rows_html = []
+    bf = settings.get("bargain_factor", 1.00)
+    anchors = settings.get("anchors", {})
+
+    for r in cache_rows:
+        ckey = r["cache_key"]
+        parts = ckey.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].endswith("GB"):
+            m_name = parts[0]
+            try:
+                m_mem = int(parts[1][:-2])
+            except ValueError:
+                continue
+        else:
+            continue
+
+        sold_med, sold_c, fast_c = get_sold_market_stats(m_name, m_mem)
+        blended, w_pct = blend_with_sold_history(r["market_price"], sold_med, sold_c, fast_c)
+        anc = anchors.get(ckey)
+        final_p = anc if anc else round((blended or r["market_price"]) * bf)
+        sold_str = f"{sold_med:.0f} BYN" if sold_med else "—"
+        weight_badge = f"<span class='badge green'>{w_pct}% продаж</span>" if w_pct > 0 else "<span class='badge gray'>витрина</span>"
+        if anc:
+            weight_badge = "<span class='badge blue'>⚓ якорь</span>"
+
+        model_rows_html.append(
+            f"<tr>"
+            f"<td><b>{html.escape(m_name)}</b> <span class='muted'>{m_mem}GB</span></td>"
+            f"<td>{r['market_price']:.0f} р. <span class='muted'>(n={r['sample_size']})</span></td>"
+            f"<td>{sold_str} <span class='muted'>(всего {sold_c} / день-в-день {fast_c})</span></td>"
+            f"<td><b>{final_p:.0f} BYN</b> {weight_badge}</td>"
+            f"<td>~{r['median_days']} дн.</td>"
+            f"</tr>"
+        )
+
+    # Последние 100 закрытых продаж
+    cur.execute("""
+        SELECT ad_id, model, memory, battery_health, district, first_seen_price, last_seen_price,
+               estimated_sold_price, days_on_market, status, last_seen_ts
+        FROM lot_history
+        WHERE status IN ('sold_fast', 'sold') AND model IS NOT NULL
+        ORDER BY last_seen_ts DESC
+        LIMIT 100
+    """)
+    sold_rows = cur.fetchall()
+    sold_rows_html = []
+    for r in sold_rows:
+        dt_str = datetime.datetime.fromtimestamp(
+            r["last_seen_ts"] or 0, tz=datetime.timezone(datetime.timedelta(hours=3))
+        ).strftime("%d.%m %H:%M")
+        badge = "<span class='badge fire'>⚡ День в день</span>" if r["status"] == "sold_fast" else "<span class='badge green'>✅ Продан</span>"
+        bat = f"{r['battery_health']}%" if r["battery_health"] else "—"
+        link = f"https://www.kufar.by/item/{r['ad_id']}"
+        sold_rows_html.append(
+            f"<tr>"
+            f"<td>{dt_str}</td>"
+            f"<td>{badge}</td>"
+            f"<td><a href='{link}' target='_blank'>{html.escape(r['model'])} ({r['memory']}GB)</a></td>"
+            f"<td>{bat}</td>"
+            f"<td>{r['last_seen_price']:.0f} р.</td>"
+            f"<td><b>~{r['estimated_sold_price']:.0f} BYN</b></td>"
+            f"<td>{r['days_on_market']:.1f} дн.</td>"
+            f"</tr>"
+        )
+
+    # Последние 80 активных лотов
+    cur.execute("""
+        SELECT ad_id, model, memory, battery_health, district, first_seen_price, last_seen_price,
+               price_drops_count, list_time_ts
+        FROM lot_history
+        WHERE status = 'active' AND model IS NOT NULL
+        ORDER BY last_seen_ts DESC
+        LIMIT 80
+    """)
+    active_rows = cur.fetchall()
+    active_rows_html = []
+    now_ts = time.time()
+    for r in active_rows:
+        days_now = max(0.0, (now_ts - (r["list_time_ts"] or now_ts)) / 86400.0)
+        bat = f"{r['battery_health']}%" if r["battery_health"] else "—"
+        drops = f"(-{r['price_drops_count']}x)" if (r["price_drops_count"] or 0) > 0 else ""
+        link = f"https://www.kufar.by/item/{r['ad_id']}"
+        active_rows_html.append(
+            f"<tr>"
+            f"<td><a href='{link}' target='_blank'>{html.escape(r['model'])} ({r['memory']}GB)</a></td>"
+            f"<td>{bat}</td>"
+            f"<td>{html.escape(r['district'] or '—')}</td>"
+            f"<td><b>{r['last_seen_price']:.0f} BYN</b> <span class='muted'>{drops}</span></td>"
+            f"<td>{days_now:.1f} дн.</td>"
+            f"</tr>"
+        )
+
+    minsk_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
+
+    template = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kufar Sniper — База данных</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 16px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 6px; color: #f8fafc; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 12px; }
+  .card .lbl { font-size: 12px; color: #94a3b8; }
+  .card .val { font-size: 22px; font-weight: 700; margin-top: 4px; color: #f8fafc; }
+  .card .val.fire { color: #fb923c; }
+  .card .val.green { color: #4ade80; }
+  .search { width: 100%; box-sizing: border-box; padding: 10px 14px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 14px; margin-bottom: 18px; }
+  h2 { font-size: 16px; margin: 22px 0 10px; color: #cbd5e1; }
+  .tbl-wrap { overflow-x: auto; background: #1e293b; border: 1px solid #334155; border-radius: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid #334155; white-space: nowrap; }
+  th { background: #0f172a; color: #94a3b8; font-weight: 600; }
+  tr:hover { background: #263348; }
+  a { color: #38bdf8; text-decoration: none; }
+  .muted { color: #94a3b8; font-size: 12px; }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge.fire { background: #7c2d12; color: #fdba74; }
+  .badge.green { background: #14532d; color: #86efac; }
+  .badge.blue { background: #1e3a8a; color: #93c5fd; }
+  .badge.gray { background: #334155; color: #cbd5e1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📦 База данных Kufar Sniper 3.6</h1>
+  <div class="sub">Сформировано: __NOW__ (Минск)</div>
+  <div class="grid">
+    <div class="card"><div class="lbl">Всего записей</div><div class="val">__TOTAL__</div></div>
+    <div class="card"><div class="lbl">⚡ Выкуп день в день</div><div class="val fire">__SOLD_FAST__</div></div>
+    <div class="card"><div class="lbl">✅ Прочие продажи</div><div class="val green">__SOLD_NORM__</div></div>
+    <div class="card"><div class="lbl">Активные лоты</div><div class="val">__ACTIVE__</div></div>
+    <div class="card"><div class="lbl">Снято без продажи</div><div class="val">__REMOVED__</div></div>
+    <div class="card"><div class="lbl">Отсеяно брака / перекупов</div><div class="val">__BANNED__ / __RESELLERS__</div></div>
+  </div>
+  <input id="q" class="search" type="text" placeholder="🔎 Быстрый поиск по всем таблицам (например: iPhone 12, 128GB, Фрунзенский)..." oninput="filterRows()">
+  <h2>📊 Рынок по моделям (Витрина 5%/35% vs Реальные продажи)</h2>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Модель</th><th>Витрина</th><th>Реальные продажи (30 дн.)</th><th>Итоговый рынок</th><th>Ликвидность</th></tr></thead>
+    <tbody>__MODEL_ROWS__</tbody>
+  </table></div>
+  <h2>🏁 Последние 100 закрытых продаж</h2>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Дата</th><th>Тип</th><th>Модель</th><th>АКБ</th><th>Цена в объявл.</th><th>Оценка с торгом</th><th>Жизнь</th></tr></thead>
+    <tbody>__SOLD_ROWS__</tbody>
+  </table></div>
+  <h2>📱 Последние 80 активных лотов</h2>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Модель</th><th>АКБ</th><th>Район</th><th>Цена</th><th>Висит</th></tr></thead>
+    <tbody>__ACTIVE_ROWS__</tbody>
+  </table></div>
+</div>
+<script>
+function filterRows() {
+  const val = document.getElementById('q').value.toLowerCase();
+  document.querySelectorAll('tbody tr').forEach(tr => {
+    tr.style.display = tr.innerText.toLowerCase().includes(val) ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>"""
+
+    html_doc = (
+        template
+        .replace("__NOW__", minsk_now)
+        .replace("__TOTAL__", str(total_lots))
+        .replace("__SOLD_FAST__", str(sold_fast_cnt))
+        .replace("__SOLD_NORM__", str(sold_norm_cnt))
+        .replace("__ACTIVE__", str(active_cnt))
+        .replace("__REMOVED__", str(removed_cnt))
+        .replace("__BANNED__", str(banned_cnt))
+        .replace("__RESELLERS__", str(resellers_total))
+        .replace("__MODEL_ROWS__", "".join(model_rows_html) or "<tr><td colspan='5'>Пока нет данных</td></tr>")
+        .replace("__SOLD_ROWS__", "".join(sold_rows_html) or "<tr><td colspan='7'>Продаж пока не зафиксировано</td></tr>")
+        .replace("__ACTIVE_ROWS__", "".join(active_rows_html) or "<tr><td colspan='5'>Активных лотов пока нет</td></tr>")
+    )
+
+    report_path = "kufar_db_report.html"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html_doc)
+
+    summary_stats = {
+        "total": total_lots,
+        "active": active_cnt,
+        "sold_fast": sold_fast_cnt,
+        "sold_norm": sold_norm_cnt,
+        "removed": removed_cnt,
+        "banned": banned_cnt,
+        "resellers": resellers_total
+    }
+    return report_path, summary_stats
+
+
+def send_db_report(settings):
+    try:
+        db_conn.commit()
+        db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        report_path, st = generate_html_db_report(settings)
+
+        # Топ-6 моделей по количеству продаж для красивой сводки в самом сообщении
+        cur = db_conn.cursor()
+        cur.execute("""
+            SELECT model, memory,
+                   COUNT(*) as total_s,
+                   SUM(CASE WHEN status = 'sold_fast' THEN 1 ELSE 0 END) as fast_s,
+                   ROUND(AVG(estimated_sold_price)) as avg_p
+            FROM lot_history
+            WHERE status IN ('sold_fast', 'sold') AND model IS NOT NULL
+            GROUP BY model, memory
+            ORDER BY total_s DESC
+            LIMIT 6
+        """)
+        top_sold = cur.fetchall()
+
+        top_lines = ""
+        for r in top_sold:
+            top_lines += f"• <b>{r['model']} ({r['memory']}GB)</b>: {r['total_s']} прод. (⚡день-в-день: {r['fast_s']}) — ср. ~{r['avg_p']:.0f} BYN\n"
+
+        db_size_kb = round(os.path.getsize(DB_FILE) / 1024.0, 1) if os.path.exists(DB_FILE) else 0
+        msg = (
+            f"📦 <b>Состояние базы данных ({db_size_kb} КБ):</b>\n\n"
+            f"• Всего лотов в истории: <b>{st['total']}</b>\n"
+            f"• ⚡ Выкуплено день в день: <b>{st['sold_fast']}</b>\n"
+            f"• ✅ Продано за 1–14 дн.: <b>{st['sold_norm']}</b>\n"
+            f"• 📱 Активных сейчас: <b>{st['active']}</b>\n"
+            f"• 🗑 Снято без продажи / ошибки: <b>{st['removed']}</b>\n"
+            f"• ⛔ Отсеяно брака: <b>{st['banned']}</b> | 🦈 Перекупов: <b>{st['resellers']}</b>\n"
+        )
+        if top_lines:
+            msg += f"\n<b>Топ моделей по собранным продажам:</b>\n{top_lines}"
+
+        send_telegram(msg)
+        send_telegram_document(report_path, "📊 <b>Читаемый отчет по базе</b> (открой прямо в браузере, есть поиск)")
+        send_telegram_document(DB_FILE, "🗄 Исходный файл SQLite (<code>sniper.db</code>) для бэкапа и ML")
+
+        try:
+            os.remove(report_path)
+        except Exception:
+            pass
+    except Exception as e:
+        send_telegram(f"⚠️ Ошибка формирования отчета по базе: {e}")
 
 
 def handle_telegram_updates(last_update_id, settings):
@@ -1346,9 +1664,13 @@ def handle_telegram_updates(last_update_id, settings):
             if text in ("/start", "/menu", "Меню"):
                 USER_WAIT_STATE["mode"] = None
                 send_telegram(
-                    "🤖 <b>Панель управления Kufar Sniper 3.5</b>\nВыбери действие на клавиатуре ниже:",
+                    "🤖 <b>Панель управления Kufar Sniper 3.6</b>\nВыбери действие на клавиатуре ниже:",
                     reply_markup=get_main_menu_keyboard()
                 )
+
+            elif text in ("/db", "📦 База / Стата"):
+                USER_WAIT_STATE["mode"] = None
+                send_db_report(settings)
 
             elif text == "🏘 Районы Минска":
                 USER_WAIT_STATE["mode"] = None
@@ -1371,9 +1693,9 @@ def handle_telegram_updates(last_update_id, settings):
                     f"• Заданные якоря: <b>{anc_str}</b>\n\n"
                     f"<b>Команды для изменения:</b>\n"
                     f"• <code>цена 150 2500</code> — изменить мин и макс цену\n"
-                    f"• <code>коэф 1.02</code> — изменить коэффициент рынка\n"
+                    f"• <code>коэф 1.00</code> — изменить коэффициент рынка\n"
                     f"• <code>жир 75 20</code> — порог жира (75 BYN и 20%)\n"
-                    f"• <code>якорь iPhone 13 128 630</code> — жестко зафиксировать рынок модели (0 чтобы удалить)"
+                    f"• <code>якорь iPhone 12 64 340</code> — жестко зафиксировать рынок модели (0 чтобы удалить)"
                 )
 
             elif text == "📊 Оценка / Тест-драйв":
@@ -1382,7 +1704,7 @@ def handle_telegram_updates(last_update_id, settings):
                     "🔎 <b>Узнать рынок / Тест-драйв своей цены</b>\n\n"
                     "Напиши модель и память (а через пробел можешь добавить свою цену продажи для проверки).\n"
                     "Примеры:\n"
-                    "• <code>iPhone 12 pro 256</code>\n"
+                    "• <code>iPhone 12 64</code>\n"
                     "• <code>iPhone 13 128 640</code> (проверит, быстро ли купят за 640 BYN)"
                 )
 
@@ -1457,34 +1779,43 @@ def handle_interactive_price_check(query_text, settings):
 
     phone_info, err = normalize_phone(query_text)
     if not phone_info:
-        send_telegram(f"❌ Не удалось распознать модель из белого списка ({err}). Попробуй написать точнее, например: <code>iPhone 12 pro 256</code>")
+        send_telegram(f"❌ Не удалось распознать модель из белого списка ({err}). Попробуй написать точнее, например: <code>iPhone 12 64</code>")
         return
 
-    send_telegram(f"⏳ Сканирую рынок Минска, РБ и Onliner для <b>{phone_info['model']} ({phone_info['memory']} GB)</b>...")
+    send_telegram(f"⏳ Сканирую рынок Куфара (Минск/РБ) и базу продаж для <b>{phone_info['model']} ({phone_info['memory']} GB)</b>...")
     m_data = get_market_data(phone_info, settings, force_refresh=True)
     if not m_data:
-        send_telegram("⚠️ Слишком мало активных объявлений на рынке (меньше 3 шт.) для расчета.")
+        send_telegram("⚠️ Слишком мало активных объявлений и продаж (меньше 3 шт.) для расчета.")
         return
 
     med = m_data["price"]
-    fast_buy = round(med * 0.86)
+    fast_buy = round(med * 0.85)
     bargain_buy = round(med * 0.92)
     min_p = m_data["min_price"]
     min_link = html.escape(m_data["min_link"] or "https://www.kufar.by")
     anc_note = " ⚓ <i>(Зафиксировано твоим якорем)</i>" if m_data.get("is_anchored") else ""
     corr_note = " <i>(корреляция памяти)</i>" if m_data.get("is_correlated") else ""
-    low_sample_warn = f"\n⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>" if m_data["sample_size"] < 8 else ""
+    low_sample_warn = f"\n⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>" if m_data["sample_size"] < 8 and m_data["sold_count"] < 6 else ""
+
+    sold_block = ""
+    if m_data["sold_count"] > 0:
+        sold_block = (
+            f"• 🏁 База продаж (30 дн.): <b>~{m_data['sold_median']:.0f} BYN</b> "
+            f"(всего: {m_data['sold_count']}, ⚡день-в-день: {m_data['fast_sold_count']})\n"
+            f"• ⚖️ Вес продаж в расчете: <b>{m_data['sold_weight_pct']}%</b> (витрина 5%/35%: ~{m_data['showcase_price']:.0f} BYN)\n"
+        )
 
     liq_label = "🔥 Высокая (улетают быстро)" if m_data["median_days"] <= 3.5 else ("⏳ Средняя" if m_data["median_days"] <= 8 else "🐌 Низкая (висят долго)")
 
     resp = (
         f"📊 <b>Аналитика: {phone_info['model']} ({phone_info['memory']} GB)</b>{low_sample_warn}\n\n"
         f"• 💎 <b>Реальная рыночная цена: ~{med:.0f} BYN</b>{corr_note}{anc_note}\n"
+        f"{sold_block}"
         f"• 🚀 Цена быстрого выкупа (жир): <b>до {fast_buy} BYN</b>\n"
         f"• 🤝 Рабочая цена под перепродажу: <b>~{bargain_buy} BYN</b>\n"
         f"• 📉 Минимум на Куфаре сейчас: <a href='{min_link}'><b>{min_p:.0f} BYN (открыть)</b></a>\n\n"
         f"⏱ Индекс ликвидности: <b>{liq_label}</b> (медиана жизни: ~{m_data['median_days']} дн.)\n"
-        f"📦 Лотов в выборке: <b>{m_data['sample_size']} шт.</b> (перекупов на модели: ~{m_data['resellers_count']})"
+        f"📦 Витринных лотов в выборке: <b>{m_data['sample_size']} шт.</b> (перекупов на модели: ~{m_data['resellers_count']})"
     )
 
     if user_test_price:
@@ -1508,23 +1839,34 @@ def send_daily_report():
     cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE first_seen_ts >= ?", (day_ago,))
     new_cnt = cur.fetchone()["c"]
 
+    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'sold_fast' AND last_seen_ts >= ?", (day_ago,))
+    fast_cnt = cur.fetchone()["c"]
+
     cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'sold' AND last_seen_ts >= ?", (day_ago,))
     sold_cnt = cur.fetchone()["c"]
 
-    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'removed_overpriced' AND last_seen_ts >= ?", (day_ago,))
+    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status IN ('removed_overpriced', 'removed_mistake') AND last_seen_ts >= ?", (day_ago,))
     removed_cnt = cur.fetchone()["c"]
 
-    cur.execute("SELECT model, memory, last_seen_price, days_on_market, estimated_sold_price FROM lot_history WHERE status = 'sold' AND last_seen_ts >= ? LIMIT 5", (day_ago,))
+    cur.execute("""
+        SELECT model, memory, last_seen_price, days_on_market, estimated_sold_price, status
+        FROM lot_history
+        WHERE status IN ('sold_fast', 'sold') AND last_seen_ts >= ?
+        ORDER BY (status = 'sold_fast') DESC, last_seen_ts DESC
+        LIMIT 6
+    """, (day_ago,))
     sold_rows = cur.fetchall()
 
     details = ""
     for r in sold_rows:
-        details += f"• {r['model']} ({r['memory']}GB) — стоял за {r['last_seen_price']:.0f} р., ушел за ~{r['days_on_market']:.1f} дн. (оценка сделки: ~{r['estimated_sold_price']:.0f} р.)\n"
+        tag = "⚡" if r["status"] == "sold_fast" else "•"
+        details += f"{tag} {r['model']} ({r['memory']}GB) — висел {r['last_seen_price']:.0f} р., ушел за ~{r['days_on_market']:.1f} дн. (с торгом: ~{r['estimated_sold_price']:.0f} р.)\n"
 
     msg = (
         f"📈 <b>Отчет по рынку за последние 24 часа:</b>\n\n"
         f"📥 Новых телефонов выложено: <b>{new_cnt} шт.</b>\n"
-        f"🏁 Реально продано (выкуплено): <b>{sold_cnt} шт.</b>\n"
+        f"⚡ Выкуплено день в день: <b>{fast_cnt} шт.</b>\n"
+        f"🏁 Продано за 1–14 дн.: <b>{sold_cnt} шт.</b>\n"
         f"🗑 Снято без продажи / перевыставлено: <b>{removed_cnt} шт.</b>\n"
     )
     if details:
@@ -1546,17 +1888,17 @@ def send_top_resellers():
     send_telegram(msg)
 
 
-# ================= 5. ДЕТЕКТОР "МОГИЛ" И ВЕЧЕРНИЙ РАДАР =================
+# ================= 5. ДЕТЕКТОР "МОГИЛ" (ВЫКУПЫ ДЕНЬ-В-ДЕНЬ vs СНЯТИЕ) И ДАЙДЖЕСТ =================
 def check_graveyard_and_digest(settings):
     now = int(time.time())
     cur = db_conn.cursor()
 
     cur.execute("""
-        SELECT ad_id, account_id, model, memory, last_seen_price, list_time_ts
+        SELECT ad_id, account_id, model, memory, last_seen_price, list_time_ts, first_seen_ts
         FROM lot_history
         WHERE status = 'active' AND model IS NOT NULL AND (? - last_seen_ts) > 3600
         ORDER BY last_seen_ts ASC
-        LIMIT 10
+        LIMIT 15
     """, (now,))
     stale_rows = cur.fetchall()
 
@@ -1566,21 +1908,46 @@ def check_graveyard_and_digest(settings):
         try:
             r = session.get(url, timeout=5)
             if r.status_code == 404 or (r.status_code == 200 and not r.json().get("result")):
-                days_lived = max(0.1, round((now - (row["list_time_ts"] or now)) / 86400.0, 1))
-                est_sold = calculate_estimated_sold_price(row["last_seen_price"], days_lived)
+                ref_ts = row["list_time_ts"] or row["first_seen_ts"] or now
+                hours_lived = max(0.05, (now - ref_ts) / 3600.0)
+                days_lived = round(hours_lived / 24.0, 2)
+                last_p = row["last_seen_price"] or 0
+                est_sold = calculate_estimated_sold_price(last_p, days_lived)
 
+                # 1. Проверка на перевыставление тем же продавцом за последние 48 часов
                 cur.execute("""
                     SELECT COUNT(*) as c FROM lot_history
                     WHERE account_id = ? AND model = ? AND ad_id != ? AND first_seen_ts > ?
-                """, (row["account_id"], row["model"], ad_id, now - 86400))
+                """, (row["account_id"], row["model"], ad_id, now - 48 * 3600))
                 relisted = cur.fetchone()["c"] > 0
 
-                new_status = "removed_overpriced" if (relisted or days_lived > 18) else "sold"
+                # 2. Проверка адекватности цены по текущему витринному кэшу (отсекает снятые оверпрайсы)
+                cache_key = f"{row['model']}_{row['memory']}GB"
+                cur.execute("SELECT market_price FROM market_cache WHERE cache_key = ?", (cache_key,))
+                mc_row = cur.fetchone()
+                showcase_ref = mc_row["market_price"] if mc_row else None
+
+                is_overpriced_fast = bool(showcase_ref and days_lived <= 1.0 and last_p > showcase_ref * 1.05)
+                is_overpriced_any = bool(showcase_ref and last_p > showcase_ref * 1.15)
+
+                if hours_lived < 0.25:
+                    # Пропало быстрее чем за 15 минут — ошибка цены/удаление/бан модерацией
+                    new_status = "removed_mistake"
+                    est_sold = None
+                elif relisted or days_lived > 14.0 or is_overpriced_fast or is_overpriced_any:
+                    new_status = "removed_overpriced"
+                    est_sold = None
+                elif days_lived <= 1.0:
+                    # Реальный выкуп день в день (в рынке или ниже рынка, без перевыставления)
+                    new_status = "sold_fast"
+                else:
+                    new_status = "sold"
+
                 cur.execute("""
                     UPDATE lot_history
                     SET status = ?, days_on_market = ?, estimated_sold_price = ?, last_seen_ts = ?
                     WHERE ad_id = ?
-                """, (new_status, days_lived, est_sold, now, ad_id))
+                """, (new_status, round(days_lived, 1), est_sold, now, ad_id))
             else:
                 cur.execute("UPDATE lot_history SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
             db_conn.commit()
@@ -1675,24 +2042,22 @@ def main():
                 """, (ad_id, str(ad.get("account_id") or ""), p_byn, p_byn, now_ts, now_ts, list_ts))
         db_conn.commit()
         send_telegram(
-            f"🚀 <b>Kufar Sniper 3.5 запущен!</b>\n"
-            f"⚡ Отклик кнопок: <b>1 сек.</b> | Умный бан-лист и точный поиск памяти\n"
+            f"🚀 <b>Kufar Sniper 3.6 запущен!</b>\n"
+            f"⚡ Формула 5%/35% + онлайн-калибровка по выкупам день-в-день\n"
             f"📦 Стартовая лента ({len(initial_ads)} лотов) записана в базу.",
             with_sound=False,
             reply_markup=get_main_menu_keyboard()
         )
 
-    print("🚀 Мониторинг Kufar 3.5 активен.")
+    print("🚀 Мониторинг Kufar 3.6 активен.")
     next_kufar_scan_ts = 0.0
     next_graveyard_check_ts = time.time() + 60.0
 
     while (time.time() - start_time) < max_seconds:
-        # 1. Мгновенный опрос кнопок Telegram (каждую 1 секунду независимо от времени суток)
         last_update_id = handle_telegram_updates(last_update_id, settings)
 
         now_f = time.time()
 
-        # 2. Фоновая проверка "могил" и вечернего дайджеста по отдельному 5-минутному таймеру
         if now_f >= next_graveyard_check_ts:
             check_graveyard_and_digest(settings)
             next_graveyard_check_ts = time.time() + GRAVEYARD_CHECK_INTERVAL
@@ -1701,7 +2066,6 @@ def main():
             time.sleep(TG_POLL_INTERVAL)
             continue
 
-        # 3. Адаптивный интервал до следующего опроса ленты Куфара (День / Вечер / Ночь)
         next_kufar_scan_ts = now_f + get_adaptive_kufar_interval()
 
         ads = get_latest_ads(settings)
@@ -1729,14 +2093,13 @@ def main():
             drops_cnt = 0
 
             if existing:
-                # Если лот уже был признан браком или нецелевой моделью — пропускаем мгновенно
                 if existing["status"] in ("banned", "ignored"):
                     continue
 
                 old_price = existing["last_seen_price"]
                 first_price = existing["first_seen_price"] or old_price
                 drops_cnt = existing["price_drops_count"] or 0
-                notified_state = existing["notified"]  # 1 = отправлен в ТГ, 0 = проверен (мало выгоды), -1 = ждет расчета рынка
+                notified_state = existing["notified"]
 
                 if price_byn < old_price and (old_price - price_byn) >= 5:
                     drops_cnt += 1
@@ -1813,7 +2176,6 @@ def main():
             if param_status != "defect":
                 param_defect_note = None
 
-            # Сохраняем лот в историю до вызова детектора продавца, чтобы активный лот учитывался в БД
             cur.execute("""
                 INSERT INTO lot_history
                 (ad_id, account_id, model, memory, battery_health, color, district, has_box,
@@ -1870,7 +2232,6 @@ def main():
                     matched_urgent.append(m_u.group(0))
             is_urgent = len(matched_urgent) > 0
 
-            # ЗВУК ТОЛЬКО НА ЧЕСТНЫЙ ЖИР!
             is_scam_suspect = profit_pct >= 50.0
             with_sound = False
 
@@ -1903,7 +2264,7 @@ def main():
             ):
                 tags.append("⚠️ <b>Проверь 100% АКБ</b>")
 
-            if m_data["sample_size"] < 8:
+            if m_data["sample_size"] < 8 and m_data["sold_count"] < 6:
                 tags.append(f"⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>")
 
             if days_old >= 14 and "торг" in clean_text(full_text):
@@ -1927,7 +2288,6 @@ def main():
             safe_title = html.escape(raw_title)
             safe_link = html.escape(link)
 
-            # Сначала обрезаем сырой текст описания, затем экранируем HTML-символы (защита от разрезания &quot;)
             raw_desc = description.strip()
             if len(raw_desc) > 260:
                 raw_desc = raw_desc[:260] + "..."
@@ -1936,6 +2296,10 @@ def main():
             bat_str = f" | 🔋 АКБ: <b>{bat_health}%</b>" if bat_health else ""
             corr_str = " <i>(корреляция памяти)</i>" if m_data["is_correlated"] else ""
             anc_str = " ⚓" if m_data.get("is_anchored") else ""
+            sold_note = (
+                f" <i>(учтено {m_data['sold_count']} прод., вес {m_data['sold_weight_pct']}%)</i>"
+                if m_data.get("sold_weight_pct", 0) > 0 and not m_data.get("is_anchored") else ""
+            )
 
             msg = f"{tier_header}\n{outside_district_tag}{price_drop_tag}"
             if is_urgent:
@@ -1947,10 +2311,10 @@ def main():
                 f"📍 Район: <b>Минск ({html.escape(district)})</b>\n"
                 f"🏷 Теги: {' | '.join(tags)}\n\n"
                 f"💰 Цена продавца: <b>{price_byn:.0f} BYN</b>\n"
-                f"📊 Рынок экземпляра: <b>~{adj_market} BYN</b>{corr_str}{anc_str}\n"
+                f"📊 Рынок экземпляра: <b>~{adj_market} BYN</b>{corr_str}{anc_str}{sold_note}\n"
                 f"🛠 Коррекция: <i>{cond_note}</i>\n"
                 f"💵 Чистая выгода: <b>{profit_byn:+.0f} BYN ({profit_pct:+.0f}%)</b>\n"
-                f"⏱ Ликвидность: <b>~{m_data['median_days']} дн.</b> (база: {m_data['sample_size']} шт., перекупов: ~{m_data['resellers_count']})\n"
+                f"⏱ Ликвидность: <b>~{m_data['median_days']} дн.</b> (витрина: {m_data['sample_size']} шт., перекупов: ~{m_data['resellers_count']})\n"
             )
 
             if short_desc:
