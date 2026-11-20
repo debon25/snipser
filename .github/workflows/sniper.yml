@@ -27,8 +27,6 @@ jobs:
         with:
           path: |
             sniper.db
-            sniper.db-wal
-            sniper.db-shm
             settings.json
           key: sniper-v3-db-${{ github.run_id }}
           restore-keys: |
