@@ -1587,6 +1587,10 @@ def send_db_report(settings):
         for r in top_sold:
             top_lines += f"• <b>{r['model']} ({r['memory']}GB)</b>: {r['total_s']} прод. (⚡день-в-день: {r['fast_s']}) — ср. ~{r['avg_p']:.0f} BYN\n"
 
+        cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'ignored'")
+        ignored_cnt = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM market_cache")
+        cache_cnt = cur.fetchone()["c"]
         db_size_kb = round(os.path.getsize(DB_FILE) / 1024.0, 1) if os.path.exists(DB_FILE) else 0
         msg = (
             f"📦 <b>Состояние базы данных ({db_size_kb} КБ):</b>\n\n"
@@ -1595,7 +1599,8 @@ def send_db_report(settings):
             f"• ✅ Продано за 1–14 дн.: <b>{st['sold_norm']}</b>\n"
             f"• 📱 Активных сейчас: <b>{st['active']}</b>\n"
             f"• 🗑 Снято без продажи / ошибки: <b>{st['removed']}</b>\n"
-            f"• ⛔ Отсеяно брака: <b>{st['banned']}</b> | 🦈 Перекупов: <b>{st['resellers']}</b>\n"
+            f"• ⛔ Брака: <b>{st['banned']}</b> | 🙈 Нецелевых: <b>{ignored_cnt}</b>\n"
+            f"• 📊 Моделей в кэше рынка: <b>{cache_cnt}</b> | 🦈 Перекупов: <b>{st['resellers']}</b>\n"
         )
         if top_lines:
             msg += f"\n<b>Топ моделей по собранным продажам:</b>\n{top_lines}"
@@ -1617,7 +1622,7 @@ def handle_telegram_updates(last_update_id, settings):
         return last_update_id
     url = f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=0"
     try:
-        r = session.get(url, timeout=4)
+        r = session.get(url, timeout=8)
         if r.status_code != 200:
             return last_update_id
         updates = r.json().get("result", [])
@@ -1902,26 +1907,51 @@ def check_graveyard_and_digest(settings):
     """, (now,))
     stale_rows = cur.fetchall()
 
+  gone_cnt = 0
+    alive_cnt = 0
+    err_cnt = 0
+
     for row in stale_rows:
         ad_id = row["ad_id"]
         url = f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru"
         try:
-            r = session.get(url, timeout=5)
-            if r.status_code == 404 or (r.status_code == 200 and not r.json().get("result")):
+            r = session.get(url, timeout=6)
+            is_gone = False
+            is_alive = False
+
+            if r.status_code in (404, 410):
+                is_gone = True
+            elif r.status_code == 200:
+                data = r.json()
+                res = data.get("result")
+                if not res:
+                    is_gone = True
+                elif isinstance(res, dict):
+                    st = str(res.get("status") or res.get("ad_status") or "").lower()
+                    if res.get("is_active") is False or st in ("deleted", "removed", "sold", "inactive", "archived", "deactivated"):
+                        is_gone = True
+                    else:
+                        is_alive = True
+                else:
+                    is_alive = True
+            else:
+                err_cnt += 1
+                print(f"⚠️ Graveyard {ad_id}: неожиданный HTTP {r.status_code}")
+
+            if is_gone:
+                gone_cnt += 1
                 ref_ts = row["list_time_ts"] or row["first_seen_ts"] or now
                 hours_lived = max(0.05, (now - ref_ts) / 3600.0)
                 days_lived = round(hours_lived / 24.0, 2)
                 last_p = row["last_seen_price"] or 0
                 est_sold = calculate_estimated_sold_price(last_p, days_lived)
 
-                # 1. Проверка на перевыставление тем же продавцом за последние 48 часов
                 cur.execute("""
                     SELECT COUNT(*) as c FROM lot_history
                     WHERE account_id = ? AND model = ? AND ad_id != ? AND first_seen_ts > ?
                 """, (row["account_id"], row["model"], ad_id, now - 48 * 3600))
                 relisted = cur.fetchone()["c"] > 0
 
-                # 2. Проверка адекватности цены по текущему витринному кэшу (отсекает снятые оверпрайсы)
                 cache_key = f"{row['model']}_{row['memory']}GB"
                 cur.execute("SELECT market_price FROM market_cache WHERE cache_key = ?", (cache_key,))
                 mc_row = cur.fetchone()
@@ -1931,14 +1961,12 @@ def check_graveyard_and_digest(settings):
                 is_overpriced_any = bool(showcase_ref and last_p > showcase_ref * 1.15)
 
                 if hours_lived < 0.25:
-                    # Пропало быстрее чем за 15 минут — ошибка цены/удаление/бан модерацией
                     new_status = "removed_mistake"
                     est_sold = None
                 elif relisted or days_lived > 14.0 or is_overpriced_fast or is_overpriced_any:
                     new_status = "removed_overpriced"
                     est_sold = None
                 elif days_lived <= 1.0:
-                    # Реальный выкуп день в день (в рынке или ниже рынка, без перевыставления)
                     new_status = "sold_fast"
                 else:
                     new_status = "sold"
@@ -1948,12 +1976,19 @@ def check_graveyard_and_digest(settings):
                     SET status = ?, days_on_market = ?, estimated_sold_price = ?, last_seen_ts = ?
                     WHERE ad_id = ?
                 """, (new_status, round(days_lived, 1), est_sold, now, ad_id))
-            else:
+                print(f"🪦 Лот {ad_id} ({row['model']}) -> {new_status} (HTTP {r.status_code})")
+            elif is_alive:
+                alive_cnt += 1
                 cur.execute("UPDATE lot_history SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
-            db_conn.commit()
-        except Exception:
-            pass
 
+            db_conn.commit()
+        except Exception as e:
+            err_cnt += 1
+            print(f"⚠️ Ошибка проверки {ad_id}: {e}")
+
+    if stale_rows:
+        print(f"🪦 Graveyard: проверено {len(stale_rows)} | ушло: {gone_cnt} | активно: {alive_cnt} | ошибок: {err_cnt}")
+        
     minsk_dt = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
     today_str = minsk_dt.strftime("%Y-%m-%d")
     if minsk_dt.hour >= 20 and settings.get("last_digest_date") != today_str:
@@ -2035,10 +2070,10 @@ def main():
             p_byn = int(ad.get("price_byn") or 0) / 100.0
             list_ts = int(parse_kufar_time(ad.get("list_time", "")))
             if ad_id and p_byn > 0:
-                cur.execute("""
+               cur.execute("""
                     INSERT OR IGNORE INTO lot_history
-                    (ad_id, account_id, first_seen_price, last_seen_price, first_seen_ts, last_seen_ts, list_time_ts, notified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                    (ad_id, account_id, first_seen_price, last_seen_price, first_seen_ts, last_seen_ts, list_time_ts, status, notified)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'ignored', 1)
                 """, (ad_id, str(ad.get("account_id") or ""), p_byn, p_byn, now_ts, now_ts, list_ts))
         db_conn.commit()
         send_telegram(
