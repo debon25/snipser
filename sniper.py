@@ -372,7 +372,7 @@ def init_db():
     except Exception:
         pass
 
-    cur.execute("""
+   cur.execute("""
         CREATE TABLE IF NOT EXISTS sellers (
             account_id TEXT PRIMARY KEY,
             ads_count INTEGER DEFAULT 1,
@@ -381,6 +381,7 @@ def init_db():
             last_seen_ts INTEGER
         )
     """)
+    cur.execute("UPDATE lot_history SET status = 'ignored' WHERE status = 'active' AND model IS NULL")
     conn.commit()
     return conn
 
@@ -1423,9 +1424,9 @@ def generate_html_db_report(settings):
             f"<td>{badge}</td>"
             f"<td><a href='{link}' target='_blank'>{html.escape(r['model'])} ({r['memory']}GB)</a></td>"
             f"<td>{bat}</td>"
-            f"<td>{r['last_seen_price']:.0f} р.</td>"
-            f"<td><b>~{r['estimated_sold_price']:.0f} BYN</b></td>"
-            f"<td>{r['days_on_market']:.1f} дн.</td>"
+            f"<td>{(r['last_seen_price'] or 0):.0f} р.</td>"
+            f"<td><b>~{(r['estimated_sold_price'] or 0):.0f} BYN</b></td>"
+            f"<td>{(r['days_on_market'] or 0):.1f} дн.</td>"
             f"</tr>"
         )
 
@@ -1585,7 +1586,7 @@ def send_db_report(settings):
 
         top_lines = ""
         for r in top_sold:
-            top_lines += f"• <b>{r['model']} ({r['memory']}GB)</b>: {r['total_s']} прод. (⚡день-в-день: {r['fast_s']}) — ср. ~{r['avg_p']:.0f} BYN\n"
+            top_lines += f"• <b>{r['model']} ({r['memory']}GB)</b>: {r['total_s']} прод. (⚡день-в-день: {r['fast_s']}) — ср. ~{(r['avg_p'] or 0):.0f} BYN\n"
 
         cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'ignored'")
         ignored_cnt = cur.fetchone()["c"]
@@ -1865,7 +1866,7 @@ def send_daily_report():
     details = ""
     for r in sold_rows:
         tag = "⚡" if r["status"] == "sold_fast" else "•"
-        details += f"{tag} {r['model']} ({r['memory']}GB) — висел {r['last_seen_price']:.0f} р., ушел за ~{r['days_on_market']:.1f} дн. (с торгом: ~{r['estimated_sold_price']:.0f} р.)\n"
+        details += f"{tag} {r['model']} ({r['memory']}GB) — висел {(r['last_seen_price'] or 0):.0f} р., ушел за ~{(r['days_on_market'] or 0):.1f} дн. (с торгом: ~{(r['estimated_sold_price'] or 0):.0f} р.)\n"
 
     msg = (
         f"📈 <b>Отчет по рынку за последние 24 часа:</b>\n\n"
@@ -1907,7 +1908,7 @@ def check_graveyard_and_digest(settings):
     """, (now,))
     stale_rows = cur.fetchall()
 
-  gone_cnt = 0
+    gone_cnt = 0
     alive_cnt = 0
     err_cnt = 0
 
@@ -2070,7 +2071,7 @@ def main():
             p_byn = int(ad.get("price_byn") or 0) / 100.0
             list_ts = int(parse_kufar_time(ad.get("list_time", "")))
             if ad_id and p_byn > 0:
-               cur.execute("""
+                cur.execute("""
                     INSERT OR IGNORE INTO lot_history
                     (ad_id, account_id, first_seen_price, last_seen_price, first_seen_ts, last_seen_ts, list_time_ts, status, notified)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'ignored', 1)
