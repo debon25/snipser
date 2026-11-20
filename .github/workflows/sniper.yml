@@ -1,13 +1,17 @@
-name: Kufar Sniper 3.0
+name: Kufar Sniper 3.6
 
 on:
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  actions: write
+
 concurrency:
   group: kufar-sniper-v3-singleton
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -19,10 +23,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Восстановление SQLite базы и настроек
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             sniper.db
+            sniper.db-wal
+            sniper.db-shm
             settings.json
           key: sniper-v3-db-${{ github.run_id }}
           restore-keys: |
@@ -36,10 +42,34 @@ jobs:
       - name: Установка библиотек
         run: pip install requests rapidfuzz
 
-      - name: Запуск Kufar Sniper 3.0
+      - name: Запуск Kufar Sniper 3.6
+        id: run-sniper
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           MAX_RUN_HOURS: '5.8'
         run: python -u sniper.py
+
+      - name: Сохранение SQLite базы и настроек
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            sniper.db
+            sniper.db-wal
+            sniper.db-shm
+            settings.json
+          key: sniper-v3-db-${{ github.run_id }}
+
+      - name: Автоперезапуск следующей смены без пауз
+        if: steps.run-sniper.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WF_FILE=$(basename "${GITHUB_WORKFLOW_REF%@*}")
+          curl -sS -f -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
