@@ -1,73 +1,131 @@
-name: Kufar Sniper 3.6
+name: Kufar Sniper 3.9 (ML DB)
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+schedule:
+- cron: '0 */6 * * *'
+workflow_dispatch:
 
 permissions:
-  contents: read
-  actions: write
+contents: write
+actions: write
 
 concurrency:
-  group: kufar-sniper-v3-singleton
-  cancel-in-progress: false
+group: kufar-sniper-v3-singleton
+cancel-in-progress: false
 
 jobs:
-  run-bot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 355
+run-bot:
+runs-on: ubuntu-latest
+timeout-minutes: 355
 
-    steps:
-      - name: Скачивание кода
-        uses: actions/checkout@v4
+steps:
+  - name: Скачивание кода
+    uses: actions/checkout@v4
 
-      - name: Восстановление SQLite базы и настроек
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            sniper.db
-            settings.json
-          key: sniper-v3-db-${{ github.run_id }}
-          restore-keys: |
-            sniper-v3-db-
+  - name: Восстановление базы из GitHub Release (основное хранилище)
+    id: restore-release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      if gh release download db-state -p "sniper-backup.tar.gz" --clobber 2>/dev/null; then
+        tar -xzf sniper-backup.tar.gz
+        rm -f sniper-backup.tar.gz
+        ls -lh sniper.db settings.json 2>/dev/null || true
+        echo "restored=true" >> "$GITHUB_OUTPUT"
+        echo "✅ База успешно восстановлена из GitHub Release (db-state)"
+      else
+        echo "restored=false" >> "$GITHUB_OUTPUT"
+        echo "ℹ️ Релиз db-state ещё не создан — пробуем резервное восстановление из cache..."
+      fi
 
-      - name: Установка Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+  - name: Резервное восстановление из Cache (миграция старой базы)
+    if: steps.restore-release.outputs.restored != 'true'
+    uses: actions/cache/restore@v4
+    with:
+      path: |
+        sniper.db
+        sniper.db-wal
+        sniper.db-shm
+        settings.json
+      key: sniper-v3-db-${{ github.run_id }}
+      restore-keys: |
+        sniper-v3-db-
 
-      - name: Установка библиотек
-        run: pip install requests rapidfuzz
+  - name: Установка Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: '3.12'
 
-      - name: Запуск Kufar Sniper 3.6
-        id: run-sniper
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-          MAX_RUN_HOURS: '5.8'
-        run: python -u sniper.py
+  - name: Установка библиотек
+    run: pip install requests rapidfuzz
 
-      - name: Сохранение SQLite базы и настроек
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            sniper.db
-            sniper.db-wal
-            sniper.db-shm
-            settings.json
-          key: sniper-v3-db-${{ github.run_id }}
+  - name: Запуск Kufar Sniper 3.9
+    id: run-sniper
+    env:
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      PROXY_URL: ${{ secrets.PROXY_URL }}
+      MAX_RUN_HOURS: '5.6'
+    run: python -u sniper.py
 
-      - name: Автоперезапуск следующей смены без пауз
-        if: steps.run-sniper.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          WF_FILE=$(basename "${GITHUB_WORKFLOW_REF%@*}")
-          curl -sS -f -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
-            -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
+  - name: Финализация SQLite WAL перед сохранением
+    if: always()
+    run: |
+      if [ -f sniper.db ]; then
+        python -c "
+      import sqlite3
+      conn = sqlite3.connect('sniper.db', timeout=30)
+      conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
+      conn.execute('PRAGMA journal_mode=DELETE;')
+      conn.commit()
+      conn.close()
+      print('✅ SQLite WAL сброшен в sniper.db')
+      "
+        ls -lh sniper.db settings.json 2>/dev/null || true
+      fi
+
+  - name: Сохранение базы в GitHub Release (постоянное хранилище)
+    if: always()
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      if [ -f sniper.db ]; then
+        FILES="sniper.db"
+        [ -f settings.json ] && FILES="$FILES settings.json"
+        tar -czf sniper-backup.tar.gz $FILES
+        ls -lh sniper-backup.tar.gz
+        if ! gh release view db-state >/dev/null 2>&1; then
+          gh release create db-state \
+            --title "Kufar Sniper DB State" \
+            --notes "Автоматическое хранилище SQLite-базы и настроек для ML" \
+            --prerelease
+        fi
+        gh release upload db-state sniper-backup.tar.gz --clobber
+        rm -f sniper-backup.tar.gz
+        echo "✅ База сохранена в GitHub Release (db-state)"
+      else
+        echo "⚠️ Файл sniper.db не найден, сохранять нечего."
+      fi
+
+  - name: Резервное сохранение в Cache (с идентичным path)
+    if: always()
+    uses: actions/cache/save@v4
+    with:
+      path: |
+        sniper.db
+        sniper.db-wal
+        sniper.db-shm
+        settings.json
+      key: sniper-v3-db-${{ github.run_id }}
+
+  - name: Автоперезапуск следующей смены без пауз
+    if: steps.run-sniper.outcome == 'success'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      WF_FILE=$(basename "${GITHUB_WORKFLOW_REF%@*}")
+      curl -sS -f -X POST \
+        -H "Accept: application/vnd.github+json" \
+        -H "Authorization: Bearer $GH_TOKEN" \
+        "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
+        -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
