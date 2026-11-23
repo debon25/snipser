@@ -1,8 +1,10 @@
+```
 name: Kufar Sniper 3.9 (ML DB)
+```
 
 on:
 schedule:
-- cron: '0 */6 * * *'
+\- cron: '0 \*/6 \* \* \*'
 workflow_dispatch:
 
 permissions:
@@ -18,11 +20,12 @@ run-bot:
 runs-on: ubuntu-latest
 timeout-minutes: 355
 
+```
 steps:
   - name: Скачивание кода
     uses: actions/checkout@v4
 
-  - name: Восстановление базы из GitHub Release (основное хранилище)
+  - name: Восстановление базы из GitHub Release
     id: restore-release
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -32,13 +35,13 @@ steps:
         rm -f sniper-backup.tar.gz
         ls -lh sniper.db settings.json 2>/dev/null || true
         echo "restored=true" >> "$GITHUB_OUTPUT"
-        echo "✅ База успешно восстановлена из GitHub Release (db-state)"
+        echo "Restored from GitHub Release"
       else
         echo "restored=false" >> "$GITHUB_OUTPUT"
-        echo "ℹ️ Релиз db-state ещё не создан — пробуем резервное восстановление из cache..."
+        echo "No release yet, falling back to cache"
       fi
 
-  - name: Резервное восстановление из Cache (миграция старой базы)
+  - name: Резервное восстановление из Cache
     if: steps.restore-release.outputs.restored != 'true'
     uses: actions/cache/restore@v4
     with:
@@ -72,19 +75,11 @@ steps:
     if: always()
     run: |
       if [ -f sniper.db ]; then
-        python -c "
-      import sqlite3
-      conn = sqlite3.connect('sniper.db', timeout=30)
-      conn.execute('PRAGMA wal_checkpoint(TRUNCATE);')
-      conn.execute('PRAGMA journal_mode=DELETE;')
-      conn.commit()
-      conn.close()
-      print('✅ SQLite WAL сброшен в sniper.db')
-      "
+        python -c "import sqlite3; c=sqlite3.connect('sniper.db', timeout=30); c.execute('PRAGMA wal_checkpoint(TRUNCATE);'); c.execute('PRAGMA journal_mode=DELETE;'); c.commit(); c.close()"
         ls -lh sniper.db settings.json 2>/dev/null || true
       fi
 
-  - name: Сохранение базы в GitHub Release (постоянное хранилище)
+  - name: Сохранение базы в GitHub Release
     if: always()
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -95,19 +90,16 @@ steps:
         tar -czf sniper-backup.tar.gz $FILES
         ls -lh sniper-backup.tar.gz
         if ! gh release view db-state >/dev/null 2>&1; then
-          gh release create db-state \
-            --title "Kufar Sniper DB State" \
-            --notes "Автоматическое хранилище SQLite-базы и настроек для ML" \
-            --prerelease
+          gh release create db-state --title "Kufar Sniper DB State" --notes "SQLite DB state" --prerelease
         fi
         gh release upload db-state sniper-backup.tar.gz --clobber
         rm -f sniper-backup.tar.gz
-        echo "✅ База сохранена в GitHub Release (db-state)"
+        echo "Saved to GitHub Release"
       else
-        echo "⚠️ Файл sniper.db не найден, сохранять нечего."
+        echo "sniper.db not found"
       fi
 
-  - name: Резервное сохранение в Cache (с идентичным path)
+  - name: Резервное сохранение в Cache
     if: always()
     uses: actions/cache/save@v4
     with:
@@ -129,3 +121,5 @@ steps:
         -H "Authorization: Bearer $GH_TOKEN" \
         "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
         -d "{\"ref\":\"${GITHUB_REF_NAME}\"}"
+
+```
