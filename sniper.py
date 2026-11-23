@@ -22,13 +22,14 @@ except ImportError:
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "1091251853").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
-MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.8"))
+MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.6"))
 
-DB_FILE = "sniper.db"
-SETTINGS_FILE = "settings.json"
+DB_FILE = os.getenv("DB_FILE", "sniper.db")
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
 
-SCAN_MIN_PRICE = 120                # Нижняя граница сканирования базы (BYN)
-SCAN_MAX_PRICE = 2800               # Верхняя граница сканирования базы (BYN)
+SCAN_MIN_PRICE = 50                 # Нижняя граница сканирования для ML-базы (BYN)
+SCAN_MAX_PRICE = 5500               # Верхняя граница сканирования для ML-базы (BYN)
+FEED_PAGE_SIZE = 50                 # 50 лотов за 1 запрос (защита от пропусков в пики)
 TG_POLL_INTERVAL = 1.0              # Опрос кнопок Telegram не чаще раза в 1 секунду
 GRAVEYARD_CHECK_INTERVAL = 300.0    # Проверка удаленных/проданных лотов раз в 5 минут
 MARKET_CACHE_TTL = 4 * 3600         # Кэш витринного рынка живет 4 часа
@@ -42,7 +43,7 @@ MINSK_DISTRICTS = [
 
 DEFAULT_SETTINGS = {
     "min_price": 120,             # Мин. цена для УВЕДОМЛЕНИЙ в Telegram
-    "max_price": 750,             # Макс. цена для УВЕДОМЛЕНИЙ в Telegram (база собирается до 2800)
+    "max_price": 750,             # Макс. цена для УВЕДОМЛЕНИЙ в Telegram (база собирается до 5500)
     "bargain_factor": 1.00,       # Коэффициент к рынку
     "districts": [],              # Пустой список = весь Минск
     "anchors": {},                # Ручные якоря цен: {"iPhone 13_128GB": 600}
@@ -342,13 +343,6 @@ def save_settings(s):
 
 
 def calculate_estimated_sold_price(last_price, days_on_market):
-    """
-    Реалистичные скидки на торг при реальной сделке:
-    - Выкуп день в день (<= 1.0 дн.): 95% (торг минимален)
-    - 1–3 дня: 90%
-    - 3–7 дней: 80%
-    - 7–14 дней: 75%
-    """
     if days_on_market <= 1.0:
         return round(last_price * 0.95)
     elif days_on_market <= 3.0:
@@ -359,9 +353,6 @@ def calculate_estimated_sold_price(last_price, days_on_market):
 
 
 def migrate_v37_database(conn):
-    """
-    Одноразовая миграция исторических продаж (совместимость со старыми базами).
-    """
     cur = conn.cursor()
     cur.execute("SELECT value FROM meta WHERE key = 'migration_v37_done'")
     if cur.fetchone():
@@ -377,12 +368,7 @@ def migrate_v37_database(conn):
     """)
     rows = cur.fetchall()
 
-    c_fast = 0
-    c_sold = 0
-    c_anom = 0
-    c_over = 0
-    c_mistake = 0
-    c_nomodel = 0
+    c_fast = c_sold = c_anom = c_over = c_mistake = c_nomodel = 0
 
     for r in rows:
         ad_id = r["ad_id"]
@@ -438,8 +424,9 @@ def migrate_v37_database(conn):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn = sqlite3.connect(DB_FILE, timeout=20)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
@@ -500,10 +487,62 @@ def init_db():
     except Exception:
         pass
 
-    # Индексы для ускорения аналитики и Graveyard
+    # --- ПОЛНАЯ ML-ТАБЛИЦА (КАЖДОЕ ОБЪЯВЛЕНИЕ КУФАРА БЕЗ ПОТЕРЬ И ОБРЕЗОК) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_ads (
+            ad_id TEXT PRIMARY KEY,
+            account_id TEXT,
+            subject TEXT,
+            body TEXT,
+            price_byn REAL,
+            first_price_byn REAL,
+            price_usd REAL,
+            currency TEXT,
+            company_ad INTEGER,
+            images_count INTEGER,
+            region TEXT,
+            district TEXT,
+            ad_parameters_json TEXT,
+            account_parameters_json TEXT,
+            paid_services_json TEXT,
+            model TEXT,
+            memory INTEGER,
+            is_assumed_mem INTEGER,
+            battery_health INTEGER,
+            color TEXT,
+            has_box INTEGER,
+            has_defects INTEGER,
+            status TEXT,
+            ban_reason TEXT,
+            list_time_ts INTEGER,
+            first_seen_ts INTEGER,
+            last_seen_ts INTEGER,
+            sold_ts INTEGER,
+            days_on_market REAL,
+            estimated_sold_price REAL,
+            price_drops_count INTEGER DEFAULT 0,
+            ad_link TEXT
+        )
+    """)
+
+    # --- ИСТОРИЯ ИЗМЕНЕНИЯ ЦЕН ДЛЯ ML (ВРЕМЕННОЙ РЯД) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ad_id TEXT NOT NULL,
+            price_byn REAL NOT NULL,
+            ts INTEGER NOT NULL,
+            source TEXT DEFAULT 'feed'
+        )
+    """)
+
+    # Индексы для ускорения аналитики, Graveyard и ML-выгрузок
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lot_sold_stats ON lot_history (model, memory, status, last_seen_ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lot_status_seen ON lot_history (status, last_seen_ts)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_lot_relist ON lot_history (account_id, model, first_seen_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_ads_status_seen ON ml_ads (status, last_seen_ts)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_ads_model_mem ON ml_ads (model, memory)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_price_history_ad ON price_history (ad_id, ts)")
 
     cur.execute("UPDATE lot_history SET status = 'ignored' WHERE status = 'active' AND model IS NULL")
     conn.commit()
@@ -533,12 +572,138 @@ def set_meta(key, value):
         pass
 
 
+def record_price_event(cur, ad_id, price_byn, ts, source="feed"):
+    """Записывает событие цены в price_history, только если цена новая или изменилась."""
+    if not ad_id or price_byn is None or price_byn <= 0:
+        return
+    cur.execute("SELECT price_byn FROM price_history WHERE ad_id = ? ORDER BY id DESC LIMIT 1", (ad_id,))
+    last = cur.fetchone()
+    if last is None or abs((last["price_byn"] or 0) - price_byn) >= 0.01:
+        cur.execute(
+            "INSERT INTO price_history (ad_id, price_byn, ts, source) VALUES (?, ?, ?, ?)",
+            (ad_id, price_byn, int(ts), source)
+        )
+
+
+def parse_region_and_district(ad_params):
+    region = None
+    district = "Не указан"
+    for param in ad_params or []:
+        p = param.get("p")
+        val = str(param.get("vl") or param.get("v") or "").strip()
+        if not val:
+            continue
+        if p == "region":
+            region = val
+        elif p == "area":
+            district = val
+    return region or "Минск", district
+
+
+def extract_price_usd(ad_obj, detail_obj=None):
+    for src in (detail_obj, ad_obj):
+        if not isinstance(src, dict):
+            continue
+        raw_usd = src.get("price_usd")
+        if raw_usd is not None and str(raw_usd).isdigit():
+            val = int(raw_usd) / 100.0
+            if val > 0:
+                return val
+    return None
+
+
+def upsert_ml_ad(
+    cur, ad, detail_res=None, body=None, phone_info=None,
+    bat_health=None, color_name=None, box_state=None, has_defects=None,
+    status="active", ban_reason=None, now_ts=None, price_byn=None, list_ts=None
+):
+    """Сохраняет КАЖДУЮ запись Куфара со всеми сырыми параметрами и текстом в ml_ads."""
+    ad_id = str(ad.get("ad_id") or "")
+    if not ad_id:
+        return
+    now_ts = int(now_ts or time.time())
+    if price_byn is None:
+        price_byn = int(ad.get("price_byn") or 0) / 100.0
+    if list_ts is None:
+        list_ts = int(parse_kufar_time(ad.get("list_time", "")))
+
+    merged_params = (detail_res.get("ad_parameters") if isinstance(detail_res, dict) and detail_res.get("ad_parameters") else ad.get("ad_parameters")) or []
+    acc_params = (detail_res.get("account_parameters") if isinstance(detail_res, dict) and detail_res.get("account_parameters") else ad.get("account_parameters")) or []
+    paid_services = (detail_res.get("paid_services") if isinstance(detail_res, dict) and detail_res.get("paid_services") else ad.get("paid_services")) or {}
+    images = (detail_res.get("images") if isinstance(detail_res, dict) and detail_res.get("images") else ad.get("images")) or []
+
+    region, district = parse_region_and_district(merged_params)
+    company_raw = detail_res.get("company_ad") if (isinstance(detail_res, dict) and "company_ad" in detail_res) else ad.get("company_ad")
+    company_ad = 1 if company_raw else (0 if company_raw is not None else None)
+    price_usd = extract_price_usd(ad, detail_res)
+    currency = ad.get("currency") or (detail_res.get("currency") if isinstance(detail_res, dict) else None) or "BYN"
+    subject = (ad.get("subject") or (detail_res.get("subject") if isinstance(detail_res, dict) else "") or "").strip()
+    full_body = body.strip() if isinstance(body, str) else None
+    link = ad.get("ad_link") or f"https://www.kufar.by/item/{ad_id}"
+
+    # box_state: 1 = явно есть, 0 = явно нет, -1 / None = не упомянуто -> NULL для ML
+    ml_box = box_state if box_state in (0, 1) else None
+    ml_defects = (1 if has_defects else 0) if has_defects is not None else None
+    model = phone_info["model"] if phone_info else None
+    memory = phone_info["memory"] if phone_info else None
+    is_assumed_mem = (1 if phone_info["is_assumed_mem"] else 0) if phone_info else None
+
+    cur.execute("""
+        INSERT INTO ml_ads (
+            ad_id, account_id, subject, body, price_byn, first_price_byn, price_usd, currency,
+            company_ad, images_count, region, district, ad_parameters_json, account_parameters_json,
+            paid_services_json, model, memory, is_assumed_mem, battery_health, color,
+            has_box, has_defects, status, ban_reason, list_time_ts, first_seen_ts, last_seen_ts, ad_link
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ad_id) DO UPDATE SET
+            subject = COALESCE(NULLIF(excluded.subject, ''), ml_ads.subject),
+            body = COALESCE(NULLIF(excluded.body, ''), ml_ads.body),
+            price_byn = excluded.price_byn,
+            price_usd = COALESCE(excluded.price_usd, ml_ads.price_usd),
+            company_ad = COALESCE(excluded.company_ad, ml_ads.company_ad),
+            images_count = COALESCE(excluded.images_count, ml_ads.images_count),
+            region = COALESCE(excluded.region, ml_ads.region),
+            district = COALESCE(excluded.district, ml_ads.district),
+            ad_parameters_json = CASE
+                WHEN excluded.ad_parameters_json IS NOT NULL AND excluded.ad_parameters_json != '[]'
+                THEN excluded.ad_parameters_json ELSE ml_ads.ad_parameters_json END,
+            account_parameters_json = CASE
+                WHEN excluded.account_parameters_json IS NOT NULL AND excluded.account_parameters_json != '[]'
+                THEN excluded.account_parameters_json ELSE ml_ads.account_parameters_json END,
+            paid_services_json = CASE
+                WHEN excluded.paid_services_json IS NOT NULL AND excluded.paid_services_json != '{}'
+                THEN excluded.paid_services_json ELSE ml_ads.paid_services_json END,
+            model = COALESCE(excluded.model, ml_ads.model),
+            memory = COALESCE(excluded.memory, ml_ads.memory),
+            is_assumed_mem = COALESCE(excluded.is_assumed_mem, ml_ads.is_assumed_mem),
+            battery_health = COALESCE(excluded.battery_health, ml_ads.battery_health),
+            color = COALESCE(excluded.color, ml_ads.color),
+            has_box = COALESCE(excluded.has_box, ml_ads.has_box),
+            has_defects = COALESCE(excluded.has_defects, ml_ads.has_defects),
+            status = excluded.status,
+            ban_reason = COALESCE(excluded.ban_reason, ml_ads.ban_reason),
+            last_seen_ts = excluded.last_seen_ts
+    """, (
+        ad_id, str(ad.get("account_id") or ""), subject, full_body, price_byn, price_byn, price_usd, currency,
+        company_ad, len(images), region, district,
+        json.dumps(merged_params, ensure_ascii=False),
+        json.dumps(acc_params, ensure_ascii=False),
+        json.dumps(paid_services, ensure_ascii=False),
+        model, memory, is_assumed_mem, bat_health, color_name,
+        ml_box, ml_defects, status, ban_reason, list_ts, now_ts, now_ts, link
+    ))
+    record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
+
+
 def close_db():
     global db_conn
     try:
         if db_conn:
             db_conn.commit()
             db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            db_conn.execute("PRAGMA journal_mode=DELETE;")
+            db_conn.commit()
             db_conn.close()
             db_conn = None
     except Exception:
@@ -585,7 +750,11 @@ IRRELEVANT_NEGATIONS_REGEX = re.compile(
 def has_marker_without_negation(text, marker):
     t = strip_harmless_phrases(text)
     neg_pattern = r"\b(?:без|не|нет|никаких|никакого|никакой|отсутствуют|отсутствует|ничего\s+не|нужно\s+без)\b"
-    after_neg_pattern = r"^\s*(?:не\s+было|нет|не\s+обнаружено|не\s+имеет|отсутствуют|отсутствует|не\s+менял\w*)\b"
+    # Поддерживаем перечисления вроде «трещин и сколов нет»
+    after_neg_pattern = (
+        r"^(?:\s*(?:и|,|/|или)\s*[а-яa-z0-9\-]+){0,3}\s+"
+        r"(?:не\s+было|нет|не\s+обнаружено|не\s+имеет|отсутствуют|отсутствует|не\s+менял\w*)\b"
+    )
 
     for m in re.finditer(rf"\b{re.escape(marker)}\b", t):
         start_idx = m.start()
@@ -593,15 +762,15 @@ def has_marker_without_negation(text, marker):
 
         prefix = t[max(0, start_idx - 55):start_idx]
         clause = re.split(r"[.!?\n]", prefix)[-1]
-        # Разделяем контрастные союзы даже без запятой, кроме «а также»
         clause = re.split(r"(?:,\s*|\s+)(?:но|однако|зато|правда|только|а(?!\s+также))\b", clause)[-1]
         clause = IRRELEVANT_NEGATIONS_REGEX.sub(" ", clause)
 
         if re.search(neg_pattern, clause):
             continue
 
-        suffix = t[end_idx:min(len(t), end_idx + 25)]
-        if re.search(after_neg_pattern, suffix):
+        suffix = t[end_idx:min(len(t), end_idx + 45)]
+        suffix_clause = re.split(r"[.!?\n]", suffix)[0]
+        if re.search(after_neg_pattern, suffix_clause):
             continue
 
         return True
@@ -668,7 +837,6 @@ def check_ban_markers(title, description, phone_type="apple", model_id=None, ad_
     if param_status == "ban":
         return param_reason
 
-    # Аксессуары проверяем строго по заголовку, аренду/прокат — по всему тексту
     for pat in ACCESSORY_TITLE_PATTERNS:
         if re.search(pat, t_title):
             return f"Аксессуар в заголовке: {pat}"
@@ -727,13 +895,12 @@ def extract_color(title, description=""):
         ("черный", r"\b(?:черн\w*|black|midnight)\b"),
         ("белый", r"\b(?:бел\w*|white|starlight)\b"),
         ("графит", r"\b(?:графит\w*|graphite)\b"),
-        ("синий", r"\b(?:син(?:ий|его|ем|яя|юю)|blue)\b"),
+        ("синий", r"\b(?:син(?:ий|его|ем|яя|юю|им|ие)|blue)\b"),
         ("фиолетовый", r"\b(?:фиолетов\w*|purple)\b"),
         ("зеленый", r"\b(?:зелен\w*|green)\b"),
         ("титан", r"\b(?:титан\w*|titanium)\b"),
     ]
 
-    # 1. Сначала ищем цвет в заголовке
     t_title = clean_text(title)
     for cname, pat in premium_colors:
         if re.search(pat, t_title):
@@ -742,7 +909,6 @@ def extract_color(title, description=""):
         if re.search(pat, t_title):
             return cname, "discount"
 
-    # 2. В описании предварительно вырезаем цвет аксессуаров (например, «красный чехол»)
     t_desc = clean_text(description)
     acc_color_re = re.compile(
         r"\b(?:красн\w*|розов\w*|желт\w*|кораллов\w*|red|pink|yellow|черн\w*|бел\w*|син\w*|зелен\w*|фиолетов\w*)\s+"
@@ -762,7 +928,13 @@ def extract_color(title, description=""):
     return "не указан", "standard"
 
 
-def check_missing_box(text):
+def detect_box_state(text):
+    """
+    Возвращает троичный признак комплекта для ML:
+    0  = явно без коробки
+    1  = явно есть коробка / полный комплект
+    -1 = не указано
+    """
     t = clean_text(text)
     no_box_patterns = [
         r"\bнет\s+коробк[иа]\b", r"\bбез\s+коробк[иа]\b",
@@ -771,12 +943,21 @@ def check_missing_box(text):
     ]
     for p in no_box_patterns:
         if re.search(p, t):
-            return False
-    return True
+            return 0
+
+    yes_box_patterns = [
+        r"\bполн\w*\s+комплект\w*\b", r"\bродн\w*\s+коробк\w*\b",
+        r"\bкоробк[аеу]\s+(?:имеется|есть|в\s+наличии|в\s+комплекте)\b",
+        r"\bс\s+коробк\w*\b", r"\bв\s+коробк\w*\b"
+    ]
+    for p in yes_box_patterns:
+        if re.search(p, t):
+            return 1
+
+    return -1
 
 
 def strip_secondary_device_mentions(text):
-    # Вырезаем только явные упоминания ДРУГИХ устройств (не «купил» и не «подарили»!)
     pattern = (
         r"\b(?:переш(?:ел|ла|ли)\s+на|перехожу\s+на|обмен\s+на|обменяю\s+на|чехол\s+(?:от|на|для)|стекло\s+(?:от|на|для))\s+"
         r"(?:[а-яa-z]+\s+){0,2}"
@@ -837,7 +1018,6 @@ def extract_memory(title, description, ad_params, valid_memories):
 
 
 def deduplicate_models(found_list):
-    """Убирает только дубли одной и той же модели, сохраняя реальные мульти-лоты."""
     unique_map = {}
     for item in found_list:
         if item[0] not in unique_map or item[4] < unique_map[item[0]][4]:
@@ -927,7 +1107,6 @@ def normalize_phone(title, description="", ad_params=None):
                 or any(re.search(p, t_full) for p in RENTAL_PATTERNS)
             )
             if HAS_RAPIDFUZZ and t_title.strip() and not is_acc_or_rent:
-                # Убираем даты (например 12.05.2023), чтобы rapidfuzz не путал их с номером модели
                 fuzz_title = re.sub(r"\b\d{1,2}\.\d{1,2}(?:\.\d{2,4})?\b", " ", t_title)
                 choices = {m[0]: m for m in MODELS_WHITELIST if not (m[1] == "apple" and not allow_apple_title)}
                 if choices:
@@ -935,7 +1114,6 @@ def normalize_phone(title, description="", ad_params=None):
                     if best:
                         cand_name = best[0].lower()
 
-                        # Обязательная проверка совпадения всех цифр поколения модели
                         cand_nums = re.findall(r"\d+", cand_name)
                         title_nums = re.findall(r"\d+", fuzz_title)
                         if not all(n in title_nums for n in cand_nums):
@@ -953,7 +1131,6 @@ def normalize_phone(title, description="", ad_params=None):
                                 mismatch = True
                                 break
 
-                        # Однобуквенные суффиксы (16e, 14t, 8a) проверяем только слитно с цифрой
                         if not mismatch:
                             for tight_s in (r"\d[eе]\b", r"\d[tт]\b", r"\d[aа]\b"):
                                 if bool(re.search(tight_s, cand_name)) != bool(re.search(tight_s, t_title)):
@@ -995,7 +1172,6 @@ def parse_kufar_time(iso_str):
 
 
 def get_model_sample_floor(model_name):
-    """Нижний порог цены для витринной выборки, отсекающий мусор/фейки без бан-слов."""
     if model_name.startswith("iPhone 16"):
         return 650
     if model_name.startswith("iPhone 15"):
@@ -1034,11 +1210,6 @@ def weighted_median(items):
 
 
 def get_sold_market_stats(model, memory, showcase_price=None):
-    """
-    Онлайн-статистика чистых реальных продаж (sold_fast + sold) за последние 30 дней.
-    Отбрасывает дефектные лоты и выбросы вне коридора 55%–110% от витрины.
-    Выкупы день в день (sold_fast) получают двойной вес (2.0x).
-    """
     now = int(time.time())
     cutoff = now - SOLD_LOOKBACK_DAYS * 86400
     cur = db_conn.cursor()
@@ -1079,10 +1250,6 @@ def get_sold_market_stats(model, memory, showcase_price=None):
 
 
 def blend_with_sold_history(showcase_price, sold_med, sold_cnt, fast_cnt):
-    """
-    Смешивает витринную цену (5%/35%) с реальными продажами в реальном времени.
-    Возвращает (blended_price, sold_weight_pct).
-    """
     if sold_med is None or sold_cnt == 0:
         return showcase_price, 0
 
@@ -1108,9 +1275,6 @@ def blend_with_sold_history(showcase_price, sold_med, sold_cnt, fast_cnt):
 
 
 def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
-    """
-    Сбор витринной выборки строго с Куфара (без 'срочно' и дефектов).
-    """
     weighted_prices = []
     days_list = []
     seen_sample_ids = set()
@@ -1132,7 +1296,7 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
         for _ in range(pages_limit):
             url = (
                 f"https://api.kufar.by/search-api/v2/search/rendered-paginated"
-                f"?cat=17010&cmp=0&lang=ru&prc=r%3A12000%2C500000{rgn_param}"
+                f"?cat=17010&cmp=0&lang=ru&prc=r%3A12000%2C550000{rgn_param}"
                 f"&query={requests.utils.quote(q_str)}&size=50&sort=lst.d"
             )
             if cursor:
@@ -1155,7 +1319,7 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
 
                         subj = ad.get("subject", "")
                         p_byn = int(ad.get("price_byn") or 0) / 100.0
-                        if p_byn < min_floor or p_byn > 5000:
+                        if p_byn < min_floor or p_byn > 5500:
                             continue
 
                         ad_params = ad.get("ad_parameters", [])
@@ -1198,9 +1362,6 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
 
 
 def compute_raw_market_for_mem(phone_info, target_memory):
-    """
-    Витринная медиана Куфара: отсечение 5% снизу (мин. 1 лот при n>=7) и 35% сверху.
-    """
     w_prices, days_list, min_lot = fetch_kufar_sample(phone_info, target_memory, region_minsk=True)
 
     if len(w_prices) < 15:
@@ -1285,7 +1446,7 @@ def get_market_data(phone_info, settings, force_refresh=False):
                     INSERT OR REPLACE INTO market_cache
                     (cache_key, market_price, min_price, min_link, sample_size, median_days, resellers_count, is_correlated, updated_ts)
                     VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
-                """, (base_key, base_val, b_min[0] if b_min[0] < 9999 else base_val, b_min[1], base_n, base_days, now))
+                """, (base_key, base_val, b_min[0] if b_min[0] < 99999 else base_val, b_min[1], base_n, base_days, now))
                 db_conn.commit()
 
         if base_val and base_n >= 5:
@@ -1316,8 +1477,7 @@ def get_market_data(phone_info, settings, force_refresh=False):
     if n < MIN_VALID_SAMPLE and sold_cnt < MIN_VALID_SAMPLE and not anchor_val:
         return None
 
-    # В market_cache сохраняем только реальную витринную цену (не подменяем её продажами!)
-    cached_min_p = min_lot[0] if min_lot[0] < 9999 else (raw_market_val or blended_raw)
+    cached_min_p = min_lot[0] if min_lot[0] < 99999 else (raw_market_val or blended_raw)
     cur.execute("""
         INSERT OR REPLACE INTO market_cache
         (cache_key, market_price, min_price, min_link, sample_size, median_days, resellers_count, is_correlated, updated_ts)
@@ -1334,7 +1494,7 @@ def get_market_data(phone_info, settings, force_refresh=False):
         "sold_count": sold_cnt,
         "fast_sold_count": fast_cnt,
         "sold_weight_pct": sold_weight_pct,
-        "min_price": min_lot[0] if min_lot[0] < 9999 else final_price,
+        "min_price": min_lot[0] if min_lot[0] < 99999 else final_price,
         "min_link": min_lot[1],
         "sample_size": n,
         "median_days": med_days or 3.0,
@@ -1471,7 +1631,6 @@ def send_telegram_document(file_path, caption=""):
 
 
 def init_telegram_update_id():
-    """Загружает последний обработанный update_id из БД, чтобы не терять команды при рестарте."""
     saved = get_meta("tg_last_update_id")
     if saved is not None and str(saved).isdigit():
         return int(saved)
@@ -1533,7 +1692,6 @@ def format_desc_for_html(title, desc):
 
 
 def generate_html_db_report(settings):
-    """Генерирует интерактивный HTML-отчет по базе с описаниями продаж за 30 дней."""
     cur = db_conn.cursor()
 
     cur.execute("SELECT status, COUNT(*) as c FROM lot_history GROUP BY status")
@@ -1653,7 +1811,7 @@ def generate_html_db_report(settings):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kufar Sniper 3.8 — База данных</title>
+<title>Kufar Sniper 3.9 — База данных</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 16px; }
   .wrap { max-width: 1280px; margin: 0 auto; }
@@ -1684,7 +1842,7 @@ def generate_html_db_report(settings):
 </head>
 <body>
 <div class="wrap">
-  <h1>📦 База данных Kufar Sniper 3.8</h1>
+  <h1>📦 База данных Kufar Sniper 3.9</h1>
   <div class="sub">Сформировано: __NOW__ (Минск) · Фильтр продаж: коридор 55%–110% от витрины, только чистые лоты</div>
   <div class="grid">
     <div class="card"><div class="lbl">Всего записей</div><div class="val">__TOTAL__</div></div>
@@ -1694,7 +1852,7 @@ def generate_html_db_report(settings):
     <div class="card"><div class="lbl">🚫 Аномалии / 🗑 Снято</div><div class="val">__ANOM__ / __OVER__</div></div>
     <div class="card"><div class="lbl">⛔ Отсеяно брака</div><div class="val">__BANNED__</div></div>
   </div>
-  <input id="q" class="search" type="text" placeholder="🔎 Поиск по моделям, памяти, районам и словам в описании (например: iPhone 13 128, коробка, идеал)..." oninput="filterRows()">
+  <input id="q" class="search" type="text" placeholder="🔎 Поиск по моделям, памяти, районам и словам в описании..." oninput="filterRows()">
   <h2>📊 Рынок по моделям (Витрина 5%/35% vs Реальные продажи)</h2>
   <div class="tbl-wrap"><table>
     <thead><tr><th>Модель</th><th>Витрина</th><th>Реальные продажи (30 дн.)</th><th>Итоговый рынок</th><th>Ликвидность</th></tr></thead>
@@ -1785,11 +1943,16 @@ def send_db_report(settings):
         with_desc_cnt = cur.fetchone()["c"]
         cur.execute("SELECT COUNT(*) as c FROM market_cache")
         cache_cnt = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM ml_ads")
+        ml_cnt = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) as c FROM price_history")
+        ph_cnt = cur.fetchone()["c"]
         db_size_kb = round(os.path.getsize(DB_FILE) / 1024.0, 1) if os.path.exists(DB_FILE) else 0
 
         msg = (
             f"📦 <b>Состояние базы данных ({db_size_kb} КБ):</b>\n\n"
-            f"• Всего записей в истории: <b>{st['total']}</b> (с описанием: <b>{with_desc_cnt}</b>)\n"
+            f"• 🧠 <b>ML-датасет (ml_ads): {ml_cnt} записей</b> | Изменений цен: <b>{ph_cnt}</b>\n"
+            f"• Всего в lot_history: <b>{st['total']}</b> (с описанием: <b>{with_desc_cnt}</b>)\n"
             f"• ⚡ Выкуплено день в день: <b>{st['sold_fast']}</b>\n"
             f"• ✅ Продано за 1–14 дн.: <b>{st['sold_norm']}</b>\n"
             f"• 📱 Активных сейчас: <b>{st['active']}</b>\n"
@@ -1801,7 +1964,7 @@ def send_db_report(settings):
             msg += f"\n<b>Топ моделей по чистым продажам:</b>\n{top_lines}"
 
         send_telegram(msg)
-        send_telegram_document(report_path, "📊 <b>Читаемый отчет по базе</b> (открой в браузере — поиск по моделям и описаниям)")
+        send_telegram_document(report_path, "📊 <b>Читаемый отчет по базе</b> (открой в браузере)")
         send_telegram_document(DB_FILE, "🗄 Исходный файл SQLite (<code>sniper.db</code>) для бэкапа и ML")
 
         try:
@@ -1828,10 +1991,9 @@ def handle_telegram_updates(last_update_id, settings, force=False):
         if r.status_code != 200:
             return last_update_id
         updates = r.json().get("result", [])
-        updated_uid = False
         for u in updates:
             last_update_id = u["update_id"]
-            updated_uid = True
+            set_meta("tg_last_update_id", last_update_id)
 
             if "callback_query" in u:
                 cb = u["callback_query"]
@@ -1885,7 +2047,7 @@ def handle_telegram_updates(last_update_id, settings, force=False):
             if text in ("/start", "/menu", "Меню"):
                 USER_WAIT_STATE["mode"] = None
                 send_telegram(
-                    "🤖 <b>Панель управления Kufar Sniper 3.8</b>\nВыбери действие на клавиатуре ниже:",
+                    "🤖 <b>Панель управления Kufar Sniper 3.9</b>\nВыбери действие на клавиатуре ниже:",
                     reply_markup=get_main_menu_keyboard()
                 )
 
@@ -1908,7 +2070,7 @@ def handle_telegram_updates(last_update_id, settings, force=False):
                 send_telegram(
                     f"⚙️ <b>Текущие настройки:</b>\n"
                     f"• Бюджет уведомлений в TG: <b>{settings['min_price']} – {settings['max_price']} BYN</b>\n"
-                    f"• Сбор базы продаж в фоне: <b>до {max(SCAN_MAX_PRICE, settings['max_price'])} BYN</b>\n"
+                    f"• Сбор ML-базы в фоне: <b>{SCAN_MIN_PRICE} – {max(SCAN_MAX_PRICE, settings['max_price'])} BYN</b>\n"
                     f"• Коэффициент рынка: <b>{settings['bargain_factor']}</b>\n"
                     f"• Порог ЖИРА: <b>{settings['fat_profit_byn']} BYN / {settings['fat_profit_pct']}%</b>\n"
                     f"• Мин. выгода под осмотр: <b>{settings['inspect_min_profit']} BYN</b>\n"
@@ -1951,7 +2113,7 @@ def handle_telegram_updates(last_update_id, settings, force=False):
                             )
                             USER_WAIT_STATE["mode"] = None
                         else:
-                            send_telegram("❌ Ошибка: минимальная цена должна быть меньше максимальной (от 10 до 50000 BYN). Попробуй ещё раз.")
+                            send_telegram("❌ Ошибка: минимальная цена должна быть меньше максимальной (от 10 до 50000 BYN).")
                     else:
                         send_telegram("❌ Укажи два числа, например: <code>цена 120 750</code>")
                 elif low.startswith("коэф"):
@@ -2011,9 +2173,6 @@ def handle_telegram_updates(last_update_id, settings, force=False):
                 handle_interactive_price_check(text, settings)
                 USER_WAIT_STATE["mode"] = None
 
-        if updated_uid:
-            set_meta("tg_last_update_id", last_update_id)
-
     except Exception as e:
         print(f"⚠️ Ошибка getUpdates: {e}")
     return last_update_id
@@ -2023,7 +2182,6 @@ def handle_interactive_price_check(query_text, settings):
     tokens = query_text.strip().split()
     user_test_price = None
 
-    # Умное отделение тестовой цены (работает для 2+ слов и цен вроде 256/512/1024 BYN)
     if len(tokens) >= 2 and tokens[-1].isdigit():
         last_val = int(tokens[-1])
         prefix_query = " ".join(tokens[:-1])
@@ -2082,7 +2240,6 @@ def handle_interactive_price_check(query_text, settings):
         f"• ⏱ Ликвидность: <b>{liq_label}</b> (~{m_data['median_days']} дн.)"
     )
 
-    # Последние 5 реальных продаж этой модели с описаниями
     cur = db_conn.cursor()
     cur.execute("""
         SELECT status, last_seen_price, estimated_sold_price, days_on_market, battery_health, title, description, last_seen_ts
@@ -2113,10 +2270,7 @@ def handle_interactive_price_check(query_text, settings):
             icon = "⚡" if r["status"] == "sold_fast" else "✅"
             bat_s = f", АКБ {r['battery_health']}%" if r["battery_health"] else ""
             raw_d = (r["description"] or r["title"] or "").strip().replace("\n", " ")
-            if raw_d:
-                desc_s = f"\n   <i>«{html.escape(raw_d[:110])}{'...' if len(raw_d) > 110 else ''}»</i>"
-            else:
-                desc_s = ""
+            desc_s = f"\n   <i>«{html.escape(raw_d[:110])}{'...' if len(raw_d) > 110 else ''}»</i>" if raw_d else ""
             resp += (
                 f"{icon} {dt_s}: <b>{(r['last_seen_price'] or 0):.0f}р ➡️ ~{(r['estimated_sold_price'] or 0):.0f} BYN</b> "
                 f"({(r['days_on_market'] or 0):.1f} дн.{bat_s}){desc_s}\n"
@@ -2140,8 +2294,8 @@ def send_daily_report():
     day_ago = now - 86400
     cur = db_conn.cursor()
 
-    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE first_seen_ts >= ?", (day_ago,))
-    new_cnt = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM ml_ads WHERE first_seen_ts >= ?", (day_ago,))
+    new_ml_cnt = cur.fetchone()["c"]
 
     cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'sold_fast' AND last_seen_ts >= ?", (day_ago,))
     fast_cnt = cur.fetchone()["c"]
@@ -2171,7 +2325,7 @@ def send_daily_report():
 
     msg = (
         f"📈 <b>Отчет по рынку за последние 24 часа:</b>\n\n"
-        f"📥 Новых объявлений записано: <b>{new_cnt} шт.</b>\n"
+        f"📥 Новых объявлений записано в ML-базу: <b>{new_ml_cnt} шт.</b>\n"
         f"⚡ Выкуплено день в день: <b>{fast_cnt} шт.</b>\n"
         f"🏁 Продано за 1–14 дн.: <b>{sold_cnt} шт.</b>\n"
         f"🗑 Отсеяно (снято / аномалии): <b>{removed_cnt} шт.</b>\n"
@@ -2181,14 +2335,14 @@ def send_daily_report():
     send_telegram(msg)
 
 
-# ================= 5. ДЕТЕКТОР ПРОДАЖ (ПРИОРИТЕТ СВЕЖИХ ЛОТОВ) И ДАЙДЖЕСТ =================
-def check_graveyard_and_digest(settings):
+# ================= 5. ДЕТЕКТОР ПРОДАЖ (С ТРЕКИНГОМ ЦЕН) И ДАЙДЖЕСТ =================
+def check_graveyard_and_digest(settings, last_update_id):
     now = int(time.time())
     cur = db_conn.cursor()
 
-    # 1. Приоритетно проверяем свежие лоты (моложе 48 ч) раз в 30 мин, чтобы не терять sold_fast
+    # 1. Приоритетно проверяем свежие лоты (моложе 48 ч) раз в 30 мин
     cur.execute("""
-        SELECT ad_id, account_id, model, memory, last_seen_price, list_time_ts, first_seen_ts, last_seen_ts
+        SELECT ad_id, account_id, model, memory, last_seen_price, price_drops_count, list_time_ts, first_seen_ts, last_seen_ts
         FROM lot_history
         WHERE status = 'active' AND model IS NOT NULL
           AND (? - first_seen_ts) <= 48 * 3600
@@ -2200,7 +2354,7 @@ def check_graveyard_and_digest(settings):
 
     # 2. Более старые лоты проверяем раз в 4 часа
     cur.execute("""
-        SELECT ad_id, account_id, model, memory, last_seen_price, list_time_ts, first_seen_ts, last_seen_ts
+        SELECT ad_id, account_id, model, memory, last_seen_price, price_drops_count, list_time_ts, first_seen_ts, last_seen_ts
         FROM lot_history
         WHERE status = 'active' AND model IS NOT NULL
           AND (? - first_seen_ts) > 48 * 3600
@@ -2214,17 +2368,27 @@ def check_graveyard_and_digest(settings):
 
     gone_cnt = 0
     alive_cnt = 0
+    price_upd_cnt = 0
     err_cnt = 0
 
     for row in stale_rows:
+        if not RUNNING:
+            break
+        last_update_id = handle_telegram_updates(last_update_id, settings)
+
         ad_id = row["ad_id"]
         url = f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru"
         try:
             r = kufar_session.get(url, timeout=6)
             is_gone = False
             is_alive = False
+            res_dict = None
 
-            if r.status_code in (404, 410):
+            if r.status_code == 429:
+                print("⚠️ Graveyard получил HTTP 429 — прерываем пачку и делаем паузу 5 сек.")
+                time.sleep(5)
+                break
+            elif r.status_code in (404, 410):
                 is_gone = True
             elif r.status_code == 200:
                 data = r.json()
@@ -2232,6 +2396,7 @@ def check_graveyard_and_digest(settings):
                 if not res:
                     is_gone = True
                 elif isinstance(res, dict):
+                    res_dict = res
                     st = str(res.get("status") or res.get("ad_status") or "").lower()
                     if res.get("is_active") is False or st in ("deleted", "removed", "sold", "inactive", "archived", "deactivated"):
                         is_gone = True
@@ -2247,7 +2412,6 @@ def check_graveyard_and_digest(settings):
                 gone_cnt += 1
                 ref_ts = row["list_time_ts"] or row["first_seen_ts"] or now
                 prev_seen_ts = row["last_seen_ts"] or now
-                # Считаем момент исчезновения как середину окна между последней проверкой и сейчас
                 est_gone_ts = (prev_seen_ts + now) / 2.0 if (now - prev_seen_ts) > 1800 else now
                 est_gone_ts = max(est_gone_ts, ref_ts)
                 hours_lived = max(0.05, (est_gone_ts - ref_ts) / 3600.0)
@@ -2292,20 +2456,116 @@ def check_graveyard_and_digest(settings):
                     SET status = ?, days_on_market = ?, estimated_sold_price = ?, last_seen_ts = ?
                     WHERE ad_id = ?
                 """, (new_status, round(days_lived, 1), est_sold, now, ad_id))
+
+                cur.execute("""
+                    UPDATE ml_ads
+                    SET status = ?, sold_ts = ?, days_on_market = ?, estimated_sold_price = ?, last_seen_ts = ?
+                    WHERE ad_id = ?
+                """, (new_status, int(est_gone_ts), round(days_lived, 2), est_sold, now, ad_id))
+
                 print(f"🪦 Лот {ad_id} ({row['model']} {last_p:.0f}р) -> {new_status} (HTTP {r.status_code})")
+
             elif is_alive:
                 alive_cnt += 1
-                cur.execute("UPDATE lot_history SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
+                old_p = row["last_seen_price"] or 0
+                new_p = old_p
+                if res_dict and res_dict.get("price_byn") is not None:
+                    try:
+                        parsed_p = int(res_dict.get("price_byn")) / 100.0
+                        if parsed_p > 0:
+                            new_p = parsed_p
+                    except Exception:
+                        pass
+
+                if new_p > 0 and abs(new_p - old_p) >= 1.0:
+                    price_upd_cnt += 1
+                    drops_inc = 1 if (old_p - new_p) >= 5.0 else 0
+                    cur.execute("""
+                        UPDATE lot_history
+                        SET last_seen_ts = ?, last_seen_price = ?, price_drops_count = COALESCE(price_drops_count, 0) + ?
+                        WHERE ad_id = ?
+                    """, (now, new_p, drops_inc, ad_id))
+                    cur.execute("""
+                        UPDATE ml_ads
+                        SET last_seen_ts = ?, price_byn = ?, price_drops_count = COALESCE(price_drops_count, 0) + ?
+                        WHERE ad_id = ?
+                    """, (now, new_p, drops_inc, ad_id))
+                    record_price_event(cur, ad_id, new_p, now, source="graveyard")
+                else:
+                    cur.execute("UPDATE lot_history SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
+                    cur.execute("UPDATE ml_ads SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
 
             db_conn.commit()
         except Exception as e:
             err_cnt += 1
             print(f"⚠️ Ошибка проверки {ad_id}: {e}")
 
-    if stale_rows:
-        print(f"🪦 Graveyard: проверено {len(stale_rows)} (свежих: {len(fresh_rows)}) | ушло: {gone_cnt} | активно: {alive_cnt} | ошибок: {err_cnt}")
+    # 3. Лёгкий трекинг жизненного цикла нецелевых моделей (Honor/Realme/Huawei и др.) для ML
+    cur.execute("""
+        SELECT ad_id, price_byn, list_time_ts, first_seen_ts, last_seen_ts
+        FROM ml_ads
+        WHERE status = 'ignored' AND model IS NULL
+          AND (? - first_seen_ts) <= 14 * 86400
+          AND (? - last_seen_ts) > 6 * 3600
+        ORDER BY last_seen_ts ASC
+        LIMIT 8
+    """, (now, now))
+    ml_other_rows = cur.fetchall()
+    for mrow in ml_other_rows:
+        if not RUNNING:
+            break
+        ad_id = mrow["ad_id"]
+        try:
+            r = kufar_session.get(f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru", timeout=6)
+            if r.status_code == 429:
+                break
+            is_gone = r.status_code in (404, 410)
+            res_dict = None
+            if r.status_code == 200:
+                res = r.json().get("result")
+                if not res:
+                    is_gone = True
+                elif isinstance(res, dict):
+                    res_dict = res
+                    st = str(res.get("status") or res.get("ad_status") or "").lower()
+                    if res.get("is_active") is False or st in ("deleted", "removed", "sold", "inactive", "archived", "deactivated"):
+                        is_gone = True
+            if is_gone:
+                ref_ts = mrow["list_time_ts"] or mrow["first_seen_ts"] or now
+                prev_ts = mrow["last_seen_ts"] or now
+                est_gone = max((prev_ts + now) / 2.0, ref_ts)
+                days_lived = round(max(0.05, (est_gone - ref_ts) / 3600.0) / 24.0, 2)
+                cur.execute("""
+                    UPDATE ml_ads
+                    SET status = 'ignored_gone', sold_ts = ?, days_on_market = ?, last_seen_ts = ?
+                    WHERE ad_id = ?
+                """, (int(est_gone), days_lived, now, ad_id))
+            elif res_dict:
+                old_p = mrow["price_byn"] or 0
+                new_p = old_p
+                if res_dict.get("price_byn") is not None:
+                    try:
+                        p = int(res_dict.get("price_byn")) / 100.0
+                        if p > 0:
+                            new_p = p
+                    except Exception:
+                        pass
+                if new_p > 0 and abs(new_p - old_p) >= 1.0:
+                    cur.execute("UPDATE ml_ads SET price_byn = ?, last_seen_ts = ? WHERE ad_id = ?", (new_p, now, ad_id))
+                    record_price_event(cur, ad_id, new_p, now, source="graveyard_ml")
+                else:
+                    cur.execute("UPDATE ml_ads SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
+            db_conn.commit()
+        except Exception:
+            pass
 
-    # Вечерний радар «Дожим висяков» — только адекватные к рынку лоты в рабочем бюджете
+    if stale_rows:
+        print(
+            f"🪦 Graveyard: проверено {len(stale_rows)} (свежих: {len(fresh_rows)}) | "
+            f"ушло: {gone_cnt} | активно: {alive_cnt} | цен обновлено: {price_upd_cnt} | ошибок: {err_cnt}"
+        )
+
+    # Вечерний радар «Дожим висяков»
     minsk_dt = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3)))
     today_str = minsk_dt.strftime("%Y-%m-%d")
     if minsk_dt.hour >= 20 and settings.get("last_digest_date") != today_str:
@@ -2339,15 +2599,17 @@ def check_graveyard_and_digest(settings):
                 msg += f"• <a href='{link}'><b>{h['model']} ({h['memory']}GB)</b></a> — {(h['last_seen_price'] or 0):.0f} BYN ({d_cnt} дн.{mkt_str})\n"
             send_telegram(msg, with_sound=False)
 
+    return last_update_id
+
 
 # ================= 6. ОСНОВНОЙ ПАРСЕР ЛЕНТЫ КУФАРА =================
 def get_latest_ads(settings):
-    """Всегда сканирует широкий рынок до 2800 BYN для чистого сбора базы продаж."""
+    """Сканирует широкий рынок (50..5500 BYN, 50 лотов за запрос) для полного сбора ML-базы."""
     min_k = min(SCAN_MIN_PRICE, int(settings.get("min_price", SCAN_MIN_PRICE))) * 100
     max_k = max(SCAN_MAX_PRICE, int(settings.get("max_price", 750))) * 100
     url = (
         f"https://api.kufar.by/search-api/v2/search/rendered-paginated"
-        f"?cat=17010&cmp=0&lang=ru&prc=r%3A{min_k}%2C{max_k}&rgn=7&size=25&sort=lst.d"
+        f"?cat=17010&cmp=0&lang=ru&prc=r%3A{min_k}%2C{max_k}&rgn=7&size={FEED_PAGE_SIZE}&sort=lst.d"
     )
     try:
         r = kufar_session.get(url, timeout=10)
@@ -2366,15 +2628,29 @@ def get_latest_ads(settings):
     return []
 
 
-def get_ad_description(ad_id):
+def get_ad_details(ad_id):
+    """
+    За один запрос возвращает (body, full_result_dict, ok).
+    При HTTP 429 делает повторную попытку вместо тихой потери описания.
+    """
     url = f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru"
-    try:
-        r = kufar_session.get(url, timeout=6)
-        if r.status_code == 200:
-            return r.json().get("result", {}).get("body", "")
-    except Exception:
-        pass
-    return ""
+    for attempt in range(2):
+        try:
+            r = kufar_session.get(url, timeout=7)
+            if r.status_code == 200:
+                res = r.json().get("result") or {}
+                if isinstance(res, dict):
+                    return (res.get("body") or ""), res, True
+                return "", {}, True
+            elif r.status_code == 429:
+                time.sleep(3 * (attempt + 1))
+                continue
+            elif r.status_code in (404, 410):
+                return "", {}, True
+        except Exception:
+            if attempt == 0:
+                time.sleep(1)
+    return "", {}, False
 
 
 def parse_district(ad):
@@ -2418,21 +2694,42 @@ def main():
             p_byn = int(ad.get("price_byn") or 0) / 100.0
             list_ts = int(parse_kufar_time(ad.get("list_time", "")))
             if ad_id and p_byn > 0:
+                raw_title = ad.get("subject", "")
+                ad_params = ad.get("ad_parameters", [])
+                norm_init, _ = normalize_phone(raw_title, "", ad_params)
                 cur.execute("""
                     INSERT OR IGNORE INTO lot_history
-                    (ad_id, account_id, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1)
-                """, (ad_id, str(ad.get("account_id") or ""), p_byn, p_byn, p_byn, now_ts, now_ts, list_ts))
+                    (ad_id, account_id, model, memory, district, first_seen_price, last_seen_price, last_drop_ref_price,
+                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1, ?)
+                """, (
+                    ad_id, str(ad.get("account_id") or ""),
+                    norm_init["model"] if norm_init else None,
+                    norm_init["memory"] if norm_init else None,
+                    parse_district(ad),
+                    p_byn, p_byn, p_byn, now_ts, now_ts, list_ts, raw_title.strip()
+                ))
+                upsert_ml_ad(
+                    cur, ad, phone_info=norm_init, status="ignored",
+                    ban_reason="cold_start_seed", now_ts=now_ts, price_byn=p_byn, list_ts=list_ts
+                )
         db_conn.commit()
         send_telegram(
-            f"🚀 <b>Kufar Sniper 3.8 запущен!</b>\n"
-            f"📦 Сбор базы до {SCAN_MAX_PRICE} BYN | Уведомления до {settings['max_price']} BYN",
+            f"🚀 <b>Kufar Sniper 3.9 запущен!</b>\n"
+            f"🧠 Сбор ML-базы: {SCAN_MIN_PRICE}–{SCAN_MAX_PRICE} BYN | Уведомления до {settings['max_price']} BYN",
             with_sound=False,
             reply_markup=get_main_menu_keyboard()
         )
 
-    print(f"🚀 Мониторинг Kufar 3.8 активен (сбор до {max(SCAN_MAX_PRICE, settings['max_price'])} BYN, уведомления {settings['min_price']}–{settings['max_price']} BYN).")
+    cur.execute("SELECT COUNT(*) as c FROM ml_ads")
+    ml_start_cnt = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) as c FROM lot_history")
+    lot_start_cnt = cur.fetchone()["c"]
+    print(
+        f"🚀 Мониторинг Kufar 3.9 активен | В базе сейчас: lot_history={lot_start_cnt}, ml_ads={ml_start_cnt} | "
+        f"Сбор: {SCAN_MIN_PRICE}–{max(SCAN_MAX_PRICE, settings['max_price'])} BYN, TG: {settings['min_price']}–{settings['max_price']} BYN."
+    )
+
     next_kufar_scan_ts = 0.0
     next_graveyard_check_ts = time.time() + 60.0
 
@@ -2442,7 +2739,7 @@ def main():
         now_f = time.time()
 
         if now_f >= next_graveyard_check_ts:
-            check_graveyard_and_digest(settings)
+            last_update_id = check_graveyard_and_digest(settings, last_update_id)
             next_graveyard_check_ts = time.time() + GRAVEYARD_CHECK_INTERVAL
 
         if now_f < next_kufar_scan_ts:
@@ -2457,7 +2754,6 @@ def main():
         for ad in reversed(ads):
             if not RUNNING:
                 break
-            # Опрашиваем Telegram не чаще раза в TG_POLL_INTERVAL (1 сек)
             last_update_id = handle_telegram_updates(last_update_id, settings)
 
             ad_id = str(ad.get("ad_id") or "")
@@ -2479,7 +2775,14 @@ def main():
             drops_cnt = 0
 
             if existing:
+                # Даже для ignored/banned фиксируем изменение цены в ML-базе
                 if existing["status"] in ("banned", "ignored"):
+                    old_p = existing["last_seen_price"] or price_byn
+                    if abs(old_p - price_byn) >= 1.0:
+                        cur.execute("UPDATE lot_history SET last_seen_price = ?, last_seen_ts = ? WHERE ad_id = ?", (price_byn, now_ts, ad_id))
+                        cur.execute("UPDATE ml_ads SET price_byn = ?, last_seen_ts = ? WHERE ad_id = ?", (price_byn, now_ts, ad_id))
+                        record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
+                        db_conn.commit()
                     continue
 
                 ref_price = existing["last_drop_ref_price"] or existing["last_seen_price"] or price_byn
@@ -2498,6 +2801,13 @@ def main():
                             last_seen_ts = ?, status = 'active', estimated_sold_price = NULL
                         WHERE ad_id = ?
                     """, (price_byn, price_byn, drops_cnt, now_ts, ad_id))
+                    cur.execute("""
+                        UPDATE ml_ads
+                        SET price_byn = ?, price_drops_count = ?, last_seen_ts = ?,
+                            status = 'active', sold_ts = NULL, estimated_sold_price = NULL
+                        WHERE ad_id = ?
+                    """, (price_byn, drops_cnt, now_ts, ad_id))
+                    record_price_event(cur, ad_id, price_byn, now_ts, source="feed_drop")
                     db_conn.commit()
 
                     if (total_drop >= 15 and total_drop_pct >= 5.0) or drops_cnt >= 2:
@@ -2508,7 +2818,6 @@ def main():
                     elif notified_state == 1:
                         continue
                 else:
-                    # Реактивируем лот, если он ранее считался проданным/снятым, и не теряем мелкие шаги снижения (<5 BYN)
                     new_ref = price_byn if price_byn > ref_price else ref_price
                     if existing["status"] != "active":
                         cur.execute("""
@@ -2517,12 +2826,23 @@ def main():
                                 status = 'active', estimated_sold_price = NULL, days_on_market = 0
                             WHERE ad_id = ?
                         """, (now_ts, price_byn, new_ref, ad_id))
+                        cur.execute("""
+                            UPDATE ml_ads
+                            SET last_seen_ts = ?, price_byn = ?, status = 'active',
+                                sold_ts = NULL, estimated_sold_price = NULL, days_on_market = NULL
+                            WHERE ad_id = ?
+                        """, (now_ts, price_byn, ad_id))
                     else:
                         cur.execute("""
                             UPDATE lot_history
                             SET last_seen_ts = ?, last_seen_price = ?, last_drop_ref_price = ?
                             WHERE ad_id = ?
                         """, (now_ts, price_byn, new_ref, ad_id))
+                        cur.execute(
+                            "UPDATE ml_ads SET last_seen_ts = ?, price_byn = ? WHERE ad_id = ?",
+                            (now_ts, price_byn, ad_id)
+                        )
+                    record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
                     db_conn.commit()
                     continue
 
@@ -2533,58 +2853,103 @@ def main():
             title_model_id = title_norm["model"] if title_norm else None
             title_phone_type = title_norm["type"] if title_norm else "apple"
 
-            if check_ban_markers(raw_title, "", title_phone_type, title_model_id, ad_params):
+            title_ban_reason = check_ban_markers(raw_title, "", title_phone_type, title_model_id, ad_params)
+            if title_ban_reason:
                 cur.execute("""
                     INSERT INTO lot_history
-                    (ad_id, account_id, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1)
-                    ON CONFLICT(ad_id) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, status = 'banned', notified = 1
-                """, (ad_id, account_id, price_byn, price_byn, price_byn, now_ts, now_ts, list_ts))
+                    (ad_id, account_id, model, memory, district, first_seen_price, last_seen_price, last_drop_ref_price,
+                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1, ?)
+                    ON CONFLICT(ad_id) DO UPDATE SET
+                        last_seen_ts = excluded.last_seen_ts, status = 'banned', notified = 1, title = excluded.title
+                """, (
+                    ad_id, account_id, title_model_id,
+                    title_norm["memory"] if title_norm else None,
+                    parse_district(ad),
+                    price_byn, price_byn, price_byn, now_ts, now_ts, list_ts, raw_title.strip()
+                ))
+                upsert_ml_ad(
+                    cur, ad, phone_info=title_norm, status="banned", ban_reason=title_ban_reason,
+                    now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+                )
                 db_conn.commit()
                 continue
 
-            description = get_ad_description(ad_id)
+            description, detail_res, details_ok = get_ad_details(ad_id)
+            if not details_ok:
+                # Временный сбой API — пропускаем сейчас, чтобы повторить на следующем скане и не потерять описание
+                print(f"⚠️ Не удалось получить описание {ad_id}, повторим в следующем цикле.")
+                continue
+
+            full_params = (detail_res.get("ad_parameters") if isinstance(detail_res, dict) and detail_res.get("ad_parameters") else ad_params) or []
             full_text = f"{raw_title}\n{description}"
 
-            phone_info, norm_err = normalize_phone(raw_title, description, ad_params)
+            phone_info, norm_err = normalize_phone(raw_title, description, full_params)
             if not phone_info:
+                box_st_other = detect_box_state(full_text)
+                color_other, _ = extract_color(raw_title, description)
                 cur.execute("""
                     INSERT INTO lot_history
-                    (ad_id, account_id, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1)
-                    ON CONFLICT(ad_id) DO UPDATE SET last_seen_ts = excluded.last_seen_ts, status = 'ignored', notified = 1
-                """, (ad_id, account_id, price_byn, price_byn, price_byn, now_ts, now_ts, list_ts))
+                    (ad_id, account_id, district, first_seen_price, last_seen_price, last_drop_ref_price,
+                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1, ?, ?)
+                    ON CONFLICT(ad_id) DO UPDATE SET
+                        last_seen_ts = excluded.last_seen_ts, status = 'ignored', notified = 1,
+                        title = excluded.title, description = excluded.description
+                """, (
+                    ad_id, account_id, parse_district(ad),
+                    price_byn, price_byn, price_byn, now_ts, now_ts, list_ts,
+                    raw_title.strip(), description.strip()
+                ))
+                upsert_ml_ad(
+                    cur, ad, detail_res=detail_res, body=description, phone_info=None,
+                    color_name=color_other, box_state=box_st_other,
+                    status="ignored", ban_reason=norm_err,
+                    now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+                )
                 db_conn.commit()
                 continue
 
-            ban_reason = check_ban_markers(raw_title, description, phone_info["type"], phone_info["model"], ad_params)
+            ban_reason = check_ban_markers(raw_title, description, phone_info["type"], phone_info["model"], full_params)
             if ban_reason:
                 print(f"⛔ [Бан: {ban_reason}] {raw_title}")
+                bat_ban = extract_battery_health(full_text) if phone_info["type"] == "apple" else None
+                color_ban, _ = extract_color(raw_title, description)
+                box_ban = detect_box_state(full_text)
                 cur.execute("""
                     INSERT INTO lot_history
-                    (ad_id, account_id, model, memory, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1)
-                    ON CONFLICT(ad_id) DO UPDATE SET model = excluded.model, memory = excluded.memory, last_seen_ts = excluded.last_seen_ts, status = 'banned', notified = 1
-                """, (ad_id, account_id, phone_info["model"], phone_info["memory"], price_byn, price_byn, price_byn, now_ts, now_ts, list_ts))
+                    (ad_id, account_id, model, memory, battery_health, district, first_seen_price, last_seen_price, last_drop_ref_price,
+                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1, ?, ?)
+                    ON CONFLICT(ad_id) DO UPDATE SET
+                        model = excluded.model, memory = excluded.memory, last_seen_ts = excluded.last_seen_ts,
+                        status = 'banned', notified = 1, title = excluded.title, description = excluded.description
+                """, (
+                    ad_id, account_id, phone_info["model"], phone_info["memory"], bat_ban, parse_district(ad),
+                    price_byn, price_byn, price_byn, now_ts, now_ts, list_ts, raw_title.strip(), description.strip()
+                ))
+                upsert_ml_ad(
+                    cur, ad, detail_res=detail_res, body=description, phone_info=phone_info,
+                    bat_health=bat_ban, color_name=color_ban, box_state=box_ban, has_defects=True,
+                    status="banned", ban_reason=ban_reason,
+                    now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+                )
                 db_conn.commit()
                 continue
 
             bat_health = extract_battery_health(full_text) if phone_info["type"] == "apple" else None
             color_name, color_tier = extract_color(raw_title, description)
-            has_box = check_missing_box(full_text)
+            box_state = detect_box_state(full_text)
+            has_box = (box_state != 0)
             district = parse_district(ad)
             link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
-            saved_title = raw_title.strip()[:150]
-            saved_desc = description.strip()[:600]
+            saved_title = raw_title.strip()
+            saved_desc = description.strip()
 
-            param_status, param_defect_note = check_ad_parameters_defects(ad_params)
+            param_status, param_defect_note = check_ad_parameters_defects(full_params)
             if param_status != "defect":
                 param_defect_note = None
 
-            # Предварительно определяем наличие дефектов для чистоты базы продаж
             _, _, lot_has_defects = adjust_lot_market_price(
                 1000, full_text, phone_info["type"], bat_health, color_tier, has_box, param_defect_note
             )
@@ -2614,6 +2979,13 @@ def main():
                   district, 1 if has_box else 0, 1 if lot_has_defects else 0,
                   price_byn, price_byn, price_byn, now_ts, now_ts, list_ts,
                   saved_title, saved_desc))
+
+            upsert_ml_ad(
+                cur, ad, detail_res=detail_res, body=description, phone_info=phone_info,
+                bat_health=bat_health, color_name=color_name, box_state=box_state, has_defects=lot_has_defects,
+                status="active", ban_reason=None,
+                now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+            )
             db_conn.commit()
 
             m_data = get_market_data(phone_info, settings)
@@ -2621,7 +2993,6 @@ def main():
                 print(f"🔇 [Мало данных: n < {MIN_VALID_SAMPLE}] {phone_info['key']}")
                 continue
 
-            # Фильтр рабочего бюджета уведомлений (в базу лот уже записан!)
             if price_byn < settings.get("min_price", 120) or price_byn > settings.get("max_price", 750):
                 print(f"💼 [В базу, вне бюджета TG ({settings['min_price']}–{settings['max_price']}): {price_byn:.0f} р.] {phone_info['key']}")
                 continue
@@ -2739,7 +3110,6 @@ def main():
             )
             msg_foot = f"\n👉 <a href='{safe_link}'><b>ОТКРЫТЬ ОБЪЯВЛЕНИЕ НА КУФАРЕ</b></a>"
 
-            # Динамически подрезаем описание, чтобы подпись к фото всегда влезала в лимит 1024 символа
             raw_desc = description.strip()
             msg_desc = ""
             if raw_desc:
