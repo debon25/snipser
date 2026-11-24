@@ -8,6 +8,7 @@ import html
 import sqlite3
 import signal
 import atexit
+import zipfile
 import datetime
 import statistics
 import requests
@@ -20,9 +21,9 @@ except ImportError:
 
 # ================= БАЗОВЫЕ НАСТРОЙКИ И СЕКРЕТЫ =================
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TG_CHAT_ID", "1091251853").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
-MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.6"))
+MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.5"))
 
 DB_FILE = os.getenv("DB_FILE", "sniper.db")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
@@ -425,8 +426,8 @@ def migrate_v37_database(conn):
 
 def init_db():
     conn = sqlite3.connect(DB_FILE, timeout=20)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA journal_mode=DELETE;")
+    conn.execute("PRAGMA synchronous=FULL;")
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
 
@@ -1622,7 +1623,7 @@ def send_telegram_document(file_path, caption=""):
                 url,
                 data={"chat_id": TG_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
                 files={"document": (os.path.basename(file_path), f)},
-                timeout=30
+                timeout=90
             )
         return r.status_code == 200
     except Exception as e:
@@ -1965,12 +1966,40 @@ def send_db_report(settings):
 
         send_telegram(msg)
         send_telegram_document(report_path, "📊 <b>Читаемый отчет по базе</b> (открой в браузере)")
-        send_telegram_document(DB_FILE, "🗄 Исходный файл SQLite (<code>sniper.db</code>) для бэкапа и ML")
 
+        tg_limit_bytes = 49 * 1000 * 1000
+        db_bytes = os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else 0
+        zip_path = "sniper_db.zip"
         try:
-            os.remove(report_path)
-        except Exception:
-            pass
+            if db_bytes <= tg_limit_bytes:
+                if not send_telegram_document(DB_FILE, "🗄 Исходный файл SQLite (<code>sniper.db</code>) для бэкапа и ML"):
+                    send_telegram("⚠️ Не удалось отправить <code>sniper.db</code> в Telegram. Забери свежий файл в GitHub Releases (<code>db-state</code>).")
+            else:
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                    zf.write(DB_FILE, arcname=os.path.basename(DB_FILE))
+                zip_bytes = os.path.getsize(zip_path)
+                db_mb = db_bytes / (1024 * 1024)
+                zip_mb = zip_bytes / (1024 * 1024)
+                if zip_bytes <= tg_limit_bytes:
+                    send_telegram_document(
+                        zip_path,
+                        f"🗜 <b>Сжатый бэкап SQLite</b> (<code>sniper.db</code>: {db_mb:.1f} МБ ➡️ zip: {zip_mb:.1f} МБ)"
+                    )
+                else:
+                    db_repo = os.getenv("DB_REPO") or os.getenv("GITHUB_REPOSITORY", "")
+                    rel_link = f"https://github.com/{db_repo}/releases/tag/db-state" if db_repo else ""
+                    link_str = f"\n👉 <a href='{html.escape(rel_link)}'><b>Скачать sniper.db из GitHub Releases</b></a>" if rel_link else ""
+                    send_telegram(
+                        f"📦 База превысила лимит Telegram 50 МБ даже в zip "
+                        f"(<code>sniper.db</code>: <b>{db_mb:.1f} МБ</b>, zip: <b>{zip_mb:.1f} МБ</b>).{link_str}"
+                    )
+        finally:
+            for tmp_p in (report_path, zip_path):
+                try:
+                    if os.path.exists(tmp_p):
+                        os.remove(tmp_p)
+                except Exception:
+                    pass
     except Exception as e:
         send_telegram(f"⚠️ Ошибка формирования отчета по базе: <code>{html.escape(str(e))}</code>")
 
@@ -2247,6 +2276,7 @@ def handle_interactive_price_check(query_text, settings):
         WHERE model = ? AND memory = ?
           AND status IN ('sold_fast', 'sold')
           AND estimated_sold_price IS NOT NULL
+          AND (has_defects IS NULL OR has_defects = 0)
         ORDER BY last_seen_ts DESC
         LIMIT 15
     """, (phone_info["model"], phone_info["memory"]))
@@ -2340,16 +2370,29 @@ def check_graveyard_and_digest(settings, last_update_id):
     now = int(time.time())
     cur = db_conn.cursor()
 
-    # 1. Приоритетно проверяем свежие лоты (моложе 48 ч) раз в 30 мин
+    # 0. Ультра-свежие лоты (моложе 2 ч) проверяем раз в 10 мин — чтобы работал removed_mistake (<15 мин)
     cur.execute("""
         SELECT ad_id, account_id, model, memory, last_seen_price, price_drops_count, list_time_ts, first_seen_ts, last_seen_ts
         FROM lot_history
         WHERE status = 'active' AND model IS NOT NULL
+          AND (? - first_seen_ts) <= 2 * 3600
+          AND (? - last_seen_ts) > 600
+        ORDER BY last_seen_ts ASC
+        LIMIT 10
+    """, (now, now))
+    ultra_fresh_rows = cur.fetchall()
+
+    # 1. Свежие лоты (2–48 ч) проверяем раз в 30 мин
+    cur.execute("""
+        SELECT ad_id, account_id, model, memory, last_seen_price, price_drops_count, list_time_ts, first_seen_ts, last_seen_ts
+        FROM lot_history
+        WHERE status = 'active' AND model IS NOT NULL
+          AND (? - first_seen_ts) > 2 * 3600
           AND (? - first_seen_ts) <= 48 * 3600
           AND (? - last_seen_ts) > 1800
         ORDER BY last_seen_ts ASC
-        LIMIT 20
-    """, (now, now))
+        LIMIT 15
+    """, (now, now, now))
     fresh_rows = cur.fetchall()
 
     # 2. Более старые лоты проверяем раз в 4 часа
@@ -2364,7 +2407,7 @@ def check_graveyard_and_digest(settings, last_update_id):
     """, (now, now))
     older_rows = cur.fetchall()
 
-    stale_rows = list(fresh_rows) + list(older_rows)
+    stale_rows = list(ultra_fresh_rows) + list(fresh_rows) + list(older_rows)
 
     gone_cnt = 0
     alive_cnt = 0
@@ -2412,7 +2455,7 @@ def check_graveyard_and_digest(settings, last_update_id):
                 gone_cnt += 1
                 ref_ts = row["list_time_ts"] or row["first_seen_ts"] or now
                 prev_seen_ts = row["last_seen_ts"] or now
-                est_gone_ts = (prev_seen_ts + now) / 2.0 if (now - prev_seen_ts) > 1800 else now
+                est_gone_ts = (prev_seen_ts + now) / 2.0 if (now - prev_seen_ts) > 120 else now
                 est_gone_ts = max(est_gone_ts, ref_ts)
                 hours_lived = max(0.05, (est_gone_ts - ref_ts) / 3600.0)
                 days_lived = round(hours_lived / 24.0, 2)
@@ -2482,9 +2525,11 @@ def check_graveyard_and_digest(settings, last_update_id):
                     drops_inc = 1 if (old_p - new_p) >= 5.0 else 0
                     cur.execute("""
                         UPDATE lot_history
-                        SET last_seen_ts = ?, last_seen_price = ?, price_drops_count = COALESCE(price_drops_count, 0) + ?
+                        SET last_seen_ts = ?, last_seen_price = ?,
+                            last_drop_ref_price = CASE WHEN ? = 1 THEN ? ELSE COALESCE(last_drop_ref_price, ?) END,
+                            price_drops_count = COALESCE(price_drops_count, 0) + ?
                         WHERE ad_id = ?
-                    """, (now, new_p, drops_inc, ad_id))
+                    """, (now, new_p, drops_inc, new_p, new_p, drops_inc, ad_id))
                     cur.execute("""
                         UPDATE ml_ads
                         SET last_seen_ts = ?, price_byn = ?, price_drops_count = COALESCE(price_drops_count, 0) + ?
@@ -2499,6 +2544,7 @@ def check_graveyard_and_digest(settings, last_update_id):
         except Exception as e:
             err_cnt += 1
             print(f"⚠️ Ошибка проверки {ad_id}: {e}")
+        time.sleep(0.25)
 
     # 3. Лёгкий трекинг жизненного цикла нецелевых моделей (Honor/Realme/Huawei и др.) для ML
     cur.execute("""
@@ -2514,6 +2560,7 @@ def check_graveyard_and_digest(settings, last_update_id):
     for mrow in ml_other_rows:
         if not RUNNING:
             break
+        last_update_id = handle_telegram_updates(last_update_id, settings)
         ad_id = mrow["ad_id"]
         try:
             r = kufar_session.get(f"https://api.kufar.by/search-api/v2/item/{ad_id}/rendered?lang=ru", timeout=6)
@@ -2558,6 +2605,7 @@ def check_graveyard_and_digest(settings, last_update_id):
             db_conn.commit()
         except Exception:
             pass
+        time.sleep(0.25)
 
     if stale_rows:
         print(
