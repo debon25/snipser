@@ -2,8 +2,8 @@
 # Run on the selected Ubuntu/Debian server only after hosting is approved.
 set -euo pipefail
 [[ $(id -u) == 0 ]] || { echo 'Run as root'; exit 1; }
-version=${1:-v4.0.1}
-[[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected a version tag such as v4.0.1'; exit 1; }
+version=${1:-v4.0.2}
+[[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected a version tag such as v4.0.2'; exit 1; }
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 commit=$(git -C "$source_dir" rev-parse --verify "${version}^{commit}")
 release="/opt/kufar-sniper/releases/${version}-${commit:0:12}"

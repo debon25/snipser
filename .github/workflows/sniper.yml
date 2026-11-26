@@ -4,6 +4,16 @@ on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: 'Shift duration: 5/10 minutes for validation, 318 for continuous collection'
+        type: choice
+        options: ['318', '5', '10']
+        default: '318'
+      continue_chain:
+        description: 'Start the next shift after a verified save'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -48,7 +58,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          MAX_RUN_HOURS: '5.3'
+          MAX_RUN_HOURS: ${{ inputs.run_minutes == '5' && '0.0833333333' || inputs.run_minutes == '10' && '0.1666666667' || '5.3' }}
         run: timeout --signal=TERM --kill-after=40s 325m python -u runner.py
       - name: Save immutable snapshot and verify remote recovery
         id: save
@@ -69,7 +79,7 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: Continue after a failed bot too, only if state is safely saved
-        if: always() && !cancelled() && steps.save.outcome == 'success' && vars.SNIPER_CHAIN_ENABLED == 'true'
+        if: always() && !cancelled() && steps.save.outcome == 'success' && vars.SNIPER_CHAIN_ENABLED == 'true' && (github.event_name != 'workflow_dispatch' || inputs.continue_chain)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
