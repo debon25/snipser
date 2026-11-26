@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Sniper feed and notification backlog
+
+[Service]
+Type=oneshot
+User=kufar
+Group=kufar
+WorkingDirectory=/opt/kufar-sniper/current
+EnvironmentFile=/etc/kufar-sniper.env
+ExecStart=/opt/kufar-sniper/current/.venv/bin/python healthcheck.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true

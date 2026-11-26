@@ -12,6 +12,13 @@ import zipfile
 import datetime
 import statistics
 import requests
+from reliability import (RetryAd, migrate, remember_ads, pending_ads, finish_ad,
+                         queue_notification, drain_outbox, recover_outbox,
+                         mark_unavailable, mark_active, settings_revision, watchdog, remember_detail)
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
 
 try:
     from rapidfuzz import process as fuzz_process, fuzz
@@ -23,7 +30,7 @@ except ImportError:
 TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
 PROXY_URL = os.getenv("PROXY_URL", "").strip()
-MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.5"))
+MAX_RUN_HOURS = float(os.getenv("MAX_RUN_HOURS", "5.5"))  # 0 = continuously
 
 DB_FILE = os.getenv("DB_FILE", "sniper.db")
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
@@ -34,7 +41,7 @@ FEED_PAGE_SIZE = 50                 # 50 лотов за 1 запрос (защ�
 TG_POLL_INTERVAL = 1.0              # Опрос кнопок Telegram не чаще раза в 1 секунду
 GRAVEYARD_CHECK_INTERVAL = 300.0    # Проверка удаленных/проданных лотов раз в 5 минут
 MARKET_CACHE_TTL = 4 * 3600         # Кэш витринного рынка живет 4 часа
-SOLD_LOOKBACK_DAYS = 30             # Глубина истории продаж для онлайн-калибровки
+SOLD_LOOKBACK_DAYS = 30             # Совместимость полей прежнего формата; эвристика отключена
 MIN_VALID_SAMPLE = 3                # Минимальная выборка (при <8 ставится предупреждающий тег)
 
 MINSK_DISTRICTS = [
@@ -327,7 +334,7 @@ def load_settings():
                 data = json.load(f)
                 s.update(data)
         except Exception as e:
-            print(f"⚠️ Ошибка чтения {SETTINGS_FILE}: {e}")
+            raise RuntimeError('Settings are unreadable; refusing to use silent defaults') from e
     if "anchors" not in s or not isinstance(s["anchors"], dict):
         s["anchors"] = {}
     return s
@@ -339,92 +346,14 @@ def save_settings(s):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(s, f, ensure_ascii=False, indent=2)
         os.replace(tmp, SETTINGS_FILE)
+        settings_revision(db_conn, s)
     except Exception as e:
         print(f"⚠️ Ошибка сохранения {SETTINGS_FILE}: {e}")
 
 
-def calculate_estimated_sold_price(last_price, days_on_market):
-    if days_on_market <= 1.0:
-        return round(last_price * 0.95)
-    elif days_on_market <= 3.0:
-        return round(last_price * 0.90)
-    elif days_on_market <= 7.0:
-        return round(last_price * 0.80)
-    return round(last_price * 0.75)
-
-
-def migrate_v37_database(conn):
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM meta WHERE key = 'migration_v37_done'")
-    if cur.fetchone():
-        return
-
-    cur.execute("SELECT cache_key, market_price FROM market_cache")
-    cache_map = {r["cache_key"]: r["market_price"] for r in cur.fetchall() if r["market_price"]}
-
-    cur.execute("""
-        SELECT ad_id, model, memory, last_seen_price, first_seen_ts, last_seen_ts, list_time_ts, days_on_market
-        FROM lot_history
-        WHERE status IN ('sold', 'sold_fast')
-    """)
-    rows = cur.fetchall()
-
-    c_fast = c_sold = c_anom = c_over = c_mistake = c_nomodel = 0
-
-    for r in rows:
-        ad_id = r["ad_id"]
-        model = r["model"]
-        mem = r["memory"]
-        last_p = r["last_seen_price"] or 0
-
-        if not model or not mem or last_p <= 0:
-            cur.execute("UPDATE lot_history SET status = 'ignored', estimated_sold_price = NULL WHERE ad_id = ?", (ad_id,))
-            c_nomodel += 1
-            continue
-
-        ref_ts = r["list_time_ts"] or r["first_seen_ts"] or 0
-        end_ts = r["last_seen_ts"] or 0
-        if ref_ts > 0 and end_ts >= ref_ts:
-            hours_lived = (end_ts - ref_ts) / 3600.0
-        else:
-            hours_lived = (r["days_on_market"] or 0.0) * 24.0
-
-        days = r["days_on_market"] if (r["days_on_market"] is not None and r["days_on_market"] > 0) else round(hours_lived / 24.0, 2)
-        showcase = cache_map.get(f"{model}_{mem}GB")
-
-        if hours_lived < 0.25:
-            cur.execute("UPDATE lot_history SET status = 'removed_mistake', estimated_sold_price = NULL WHERE ad_id = ?", (ad_id,))
-            c_mistake += 1
-        elif days > 14.0:
-            cur.execute("UPDATE lot_history SET status = 'removed_overpriced', estimated_sold_price = NULL WHERE ad_id = ?", (ad_id,))
-            c_over += 1
-        elif showcase and last_p < showcase * 0.55:
-            cur.execute("UPDATE lot_history SET status = 'removed_anomaly', estimated_sold_price = NULL WHERE ad_id = ?", (ad_id,))
-            c_anom += 1
-        elif showcase and ((days <= 1.0 and last_p > showcase * 1.05) or (last_p > showcase * 1.10)):
-            cur.execute("UPDATE lot_history SET status = 'removed_overpriced', estimated_sold_price = NULL WHERE ad_id = ?", (ad_id,))
-            c_over += 1
-        else:
-            est = calculate_estimated_sold_price(last_p, days)
-            new_st = "sold_fast" if days <= 1.0 else "sold"
-            cur.execute(
-                "UPDATE lot_history SET status = ?, estimated_sold_price = ?, days_on_market = ? WHERE ad_id = ?",
-                (new_st, est, round(days, 1), ad_id)
-            )
-            if new_st == "sold_fast":
-                c_fast += 1
-            else:
-                c_sold += 1
-
-    cur.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('migration_v37_done', ?)", (str(int(time.time())),))
-    conn.commit()
-    print(
-        f"🧹 Миграция базы v3.7 завершена: ⚡день-в-день={c_fast} | ✅продажи={c_sold} | "
-        f"🚫аномалии(<55%)={c_anom} | 🗑снято(>110%/14д)={c_over} | ⚠️ошибки={c_mistake} | 🙈без модели={c_nomodel}"
-    )
-
-
 def init_db():
+    if not os.path.isfile(DB_FILE) and os.getenv('SNIPER_ALLOW_NEW_DB') != '1':
+        raise RuntimeError('DB missing: restore a snapshot or use runner.py --initialize explicitly')
     conn = sqlite3.connect(DB_FILE, timeout=20)
     conn.execute("PRAGMA journal_mode=DELETE;")
     conn.execute("PRAGMA synchronous=FULL;")
@@ -547,7 +476,8 @@ def init_db():
 
     cur.execute("UPDATE lot_history SET status = 'ignored' WHERE status = 'active' AND model IS NULL")
     conn.commit()
-    migrate_v37_database(conn)
+    migrate(conn)
+    recover_outbox(conn)
     return conn
 
 
@@ -659,7 +589,7 @@ def upsert_ml_ad(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(ad_id) DO UPDATE SET
             subject = COALESCE(NULLIF(excluded.subject, ''), ml_ads.subject),
-            body = COALESCE(NULLIF(excluded.body, ''), ml_ads.body),
+            body = COALESCE(excluded.body, ml_ads.body),
             price_byn = excluded.price_byn,
             price_usd = COALESCE(excluded.price_usd, ml_ads.price_usd),
             company_ad = COALESCE(excluded.company_ad, ml_ads.company_ad),
@@ -683,7 +613,7 @@ def upsert_ml_ad(
             has_box = COALESCE(excluded.has_box, ml_ads.has_box),
             has_defects = COALESCE(excluded.has_defects, ml_ads.has_defects),
             status = excluded.status,
-            ban_reason = COALESCE(excluded.ban_reason, ml_ads.ban_reason),
+            ban_reason = excluded.ban_reason,
             last_seen_ts = excluded.last_seen_ts
     """, (
         ad_id, str(ad.get("account_id") or ""), subject, full_body, price_byn, price_byn, price_usd, currency,
@@ -1211,68 +1141,13 @@ def weighted_median(items):
 
 
 def get_sold_market_stats(model, memory, showcase_price=None):
-    now = int(time.time())
-    cutoff = now - SOLD_LOOKBACK_DAYS * 86400
-    cur = db_conn.cursor()
-    cur.execute("""
-        SELECT status, last_seen_price, estimated_sold_price, last_seen_ts, days_on_market
-        FROM lot_history
-        WHERE model = ? AND memory = ?
-          AND status IN ('sold_fast', 'sold')
-          AND estimated_sold_price IS NOT NULL AND estimated_sold_price > 0
-          AND (battery_health IS NULL OR battery_health >= 80)
-          AND (has_defects IS NULL OR has_defects = 0)
-          AND last_seen_ts >= ?
-    """, (model, memory, cutoff))
-    rows = cur.fetchall()
-    if not rows:
-        return None, 0, 0
-
-    weighted_sales = []
-    fast_cnt = 0
-    for r in rows:
-        ref_p = r["last_seen_price"] or r["estimated_sold_price"]
-        if showcase_price and showcase_price > 0:
-            if ref_p < showcase_price * 0.55 or ref_p > showcase_price * 1.10:
-                continue
-
-        age_days = max(0.0, (now - (r["last_seen_ts"] or now)) / 86400.0)
-        w = max(0.40, 1.0 - 0.02 * age_days)
-        if r["status"] == "sold_fast" or (r["days_on_market"] is not None and r["days_on_market"] <= 1.0):
-            w *= 2.0
-            fast_cnt += 1
-        weighted_sales.append((r["estimated_sold_price"], w))
-
-    if not weighted_sales:
-        return None, 0, 0
-
-    sold_med = round(weighted_median(weighted_sales))
-    return sold_med, len(weighted_sales), fast_cnt
+    # No independently confirmed transactions are available. Disappearances
+    # and old heuristic prices MUST NOT calibrate the asking-price estimate.
+    return None, 0, 0
 
 
 def blend_with_sold_history(showcase_price, sold_med, sold_cnt, fast_cnt):
-    if sold_med is None or sold_cnt == 0:
-        return showcase_price, 0
-
-    if fast_cnt >= 5 or sold_cnt >= 15:
-        alpha = 0.85
-    elif fast_cnt >= 3 or sold_cnt >= 6:
-        alpha = 0.60
-    elif fast_cnt >= 2 or sold_cnt >= 3:
-        alpha = 0.35
-    else:
-        alpha = 0.0
-
-    if showcase_price is None:
-        if sold_cnt >= MIN_VALID_SAMPLE:
-            return sold_med, 100
-        return None, 0
-
-    if alpha == 0.0:
-        return showcase_price, 0
-
-    blended = round(sold_med * alpha + showcase_price * (1.0 - alpha))
-    return blended, int(round(alpha * 100))
+    return showcase_price, 0
 
 
 def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
@@ -1301,7 +1176,7 @@ def fetch_kufar_sample(phone_info, target_memory, region_minsk=True):
                 f"&query={requests.utils.quote(q_str)}&size=50&sort=lst.d"
             )
             if cursor:
-                url += f"&cursor={cursor}"
+                url += f"&cursor={requests.utils.quote(cursor, safe='')}"
 
             for attempt in range(2):
                 try:
@@ -1418,7 +1293,7 @@ def get_market_data(phone_info, settings, force_refresh=False):
                     "min_price": row["min_price"] or p,
                     "min_link": row["min_link"] or "",
                     "sample_size": row["sample_size"] or 0,
-                    "median_days": row["median_days"] or 3.0,
+                    "median_days": row["median_days"] if row["median_days"] is not None else "нет данных",
                     "is_correlated": bool(row["is_correlated"]) if "is_correlated" in row.keys() else False,
                     "is_anchored": bool(anchor_val)
                 }
@@ -1483,7 +1358,7 @@ def get_market_data(phone_info, settings, force_refresh=False):
         INSERT OR REPLACE INTO market_cache
         (cache_key, market_price, min_price, min_link, sample_size, median_days, resellers_count, is_correlated, updated_ts)
         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
-    """, (cache_key, raw_market_val, cached_min_p, min_lot[1], n, med_days or 3.0, 1 if is_correlated else 0, now))
+    """, (cache_key, raw_market_val, cached_min_p, min_lot[1], n, med_days if med_days is not None else 0.0, 1 if is_correlated else 0, now))
     db_conn.commit()
 
     scaled_price = round(blended_raw * bf)
@@ -1498,7 +1373,7 @@ def get_market_data(phone_info, settings, force_refresh=False):
         "min_price": min_lot[0] if min_lot[0] < 99999 else final_price,
         "min_link": min_lot[1],
         "sample_size": n,
-        "median_days": med_days or 3.0,
+        "median_days": med_days if med_days is not None else 0.0,
         "is_correlated": is_correlated,
         "is_anchored": bool(anchor_val)
     }
@@ -1608,9 +1483,47 @@ def send_telegram(text, photo_url=None, with_sound=False, reply_markup=None):
                 retry_after = r.json().get("parameters", {}).get("retry_after", 5)
                 time.sleep(retry_after)
         except Exception as e:
-            print(f"⚠️ Ошибка Telegram API: {e}")
+            print(f"⚠️ Ошибка Telegram API: {type(e).__name__}")
             time.sleep(2)
     return False
+
+
+def send_notification(payload):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return dict(ok=False, error='telegram_credentials_missing', retry_after=300)
+    if payload.get('ad_id'):
+        _, details, ok = get_ad_details(payload['ad_id'])
+        if not ok:
+            return dict(ok=False, error='preflight_details_unavailable')
+        status = str(details.get('status') or details.get('ad_status') or '').lower()
+        if details.get('is_active') is False or status in ('deleted','removed','sold','inactive','archived','deactivated'):
+            with db_conn:
+                mark_unavailable(db_conn, payload['ad_id'], int(time.time()), 'preflight_inactive')
+            return dict(cancelled=True, error='ad_unavailable')
+        if details.get('price_byn') is not None:
+            current = int(details['price_byn']) / 100.0
+            if current <= 0 or abs(current - payload['asking_price']) >= 0.01:
+                cached = db_conn.execute('SELECT payload FROM feed_inbox WHERE ad_id=?', (payload['ad_id'],)).fetchone()
+                if cached:
+                    ad = json.loads(cached[0])
+                    ad['price_byn'] = str(round(current * 100))
+                    with db_conn:
+                        remember_ads(db_conn, [ad])
+                return dict(cancelled=True, error='asking_price_changed')
+    photo = payload.get('photo_url') if visible_html_len(payload['text']) <= 1020 else None
+    method = 'sendPhoto' if photo else 'sendMessage'
+    data = dict(chat_id=TG_CHAT_ID, parse_mode='HTML', disable_notification=not payload.get('with_sound'))
+    data.update(dict(photo=photo, caption=payload['text']) if photo else dict(text=payload['text'], disable_web_page_preview=True))
+    try:
+        response = tg_session.post(f'https://api.telegram.org/bot{TG_TOKEN}/{method}', data=data, timeout=10)
+        result = response.json()
+        if response.status_code == 200 and result.get('ok') is True:
+            return dict(ok=True, message_id=result.get('result', {}).get('message_id'))
+        return dict(ok=False, error=f"telegram_http_{response.status_code}",
+                    retry_after=result.get('parameters', {}).get('retry_after', 0),
+                    drop_photo=bool(photo and response.status_code == 400))
+    except Exception as exc:
+        return dict(ok=False, error='delivery_unknown_' + type(exc).__name__)
 
 
 def send_telegram_document(file_path, caption=""):
@@ -1627,7 +1540,7 @@ def send_telegram_document(file_path, caption=""):
             )
         return r.status_code == 200
     except Exception as e:
-        print(f"⚠️ Ошибка отправки файла {file_path}: {e}")
+        print(f"⚠️ Ошибка отправки файла: {type(e).__name__}")
         return False
 
 
@@ -1693,315 +1606,46 @@ def format_desc_for_html(title, desc):
 
 
 def generate_html_db_report(settings):
-    cur = db_conn.cursor()
-
-    cur.execute("SELECT status, COUNT(*) as c FROM lot_history GROUP BY status")
-    status_counts = {r["status"]: r["c"] for r in cur.fetchall()}
-    total_lots = sum(status_counts.values())
-    active_cnt = status_counts.get("active", 0)
-    sold_fast_cnt = status_counts.get("sold_fast", 0)
-    sold_norm_cnt = status_counts.get("sold", 0)
-    removed_over_cnt = status_counts.get("removed_overpriced", 0) + status_counts.get("removed_mistake", 0)
-    removed_anom_cnt = status_counts.get("removed_anomaly", 0)
-    banned_cnt = status_counts.get("banned", 0)
-
-    cur.execute("SELECT * FROM market_cache ORDER BY updated_ts DESC")
-    cache_rows = cur.fetchall()
-    model_rows_html = []
-    bf = settings.get("bargain_factor", 1.00)
-    anchors = settings.get("anchors", {})
-
-    for r in cache_rows:
-        ckey = r["cache_key"]
-        parts = ckey.rsplit("_", 1)
-        if len(parts) == 2 and parts[1].endswith("GB"):
-            m_name = parts[0]
-            try:
-                m_mem = int(parts[1][:-2])
-            except ValueError:
-                continue
-        else:
-            continue
-
-        showcase_p = r["market_price"]
-        sold_med, sold_c, fast_c = get_sold_market_stats(m_name, m_mem, showcase_p)
-        blended, w_pct = blend_with_sold_history(showcase_p, sold_med, sold_c, fast_c)
-        anc = anchors.get(ckey)
-        base_calc = blended if blended is not None else (showcase_p or 0)
-        final_p = anc if anc else round(base_calc * bf)
-        showcase_str = f"{showcase_p:.0f} р." if showcase_p else "—"
-        sold_str = f"{sold_med:.0f} BYN" if sold_med else "—"
-        weight_badge = f"<span class='badge green'>{w_pct}% продаж</span>" if w_pct > 0 else "<span class='badge gray'>витрина</span>"
-        if anc:
-            weight_badge = "<span class='badge blue'>⚓ якорь</span>"
-
-        model_rows_html.append(
-            f"<tr>"
-            f"<td><b>{html.escape(m_name)}</b> <span class='muted'>{m_mem}GB</span></td>"
-            f"<td>{showcase_str} <span class='muted'>(n={r['sample_size'] or 0})</span></td>"
-            f"<td>{sold_str} <span class='muted'>(всего {sold_c} / ≤1д: {fast_c})</span></td>"
-            f"<td><b>{final_p:.0f} BYN</b> {weight_badge}</td>"
-            f"<td>~{(r['median_days'] or 0):.1f} дн.</td>"
-            f"</tr>"
-        )
-
-    cutoff_30d = int(time.time()) - SOLD_LOOKBACK_DAYS * 86400
-    cur.execute("""
-        SELECT ad_id, model, memory, battery_health, district, last_seen_price,
-               estimated_sold_price, days_on_market, status, last_seen_ts, title, description
-        FROM lot_history
-        WHERE status IN ('sold_fast', 'sold') AND model IS NOT NULL AND last_seen_ts >= ?
-        ORDER BY last_seen_ts DESC
-        LIMIT 1000
-    """, (cutoff_30d,))
-    sold_rows = cur.fetchall()
-    sold_rows_html = []
-    for r in sold_rows:
-        dt_str = datetime.datetime.fromtimestamp(
-            r["last_seen_ts"] or 0, tz=datetime.timezone(datetime.timedelta(hours=3))
-        ).strftime("%d.%m %H:%M")
-        badge = "<span class='badge fire'>⚡ День в день</span>" if r["status"] == "sold_fast" else "<span class='badge green'>✅ Продан</span>"
-        bat = f"{r['battery_health']}%" if r["battery_health"] else "—"
-        link = f"https://www.kufar.by/item/{r['ad_id']}"
-        desc_html = format_desc_for_html(r["title"], r["description"])
-        sold_rows_html.append(
-            f"<tr>"
-            f"<td>{dt_str}</td>"
-            f"<td>{badge}</td>"
-            f"<td><a href='{link}' target='_blank'>{html.escape(r['model'])} ({r['memory']}GB)</a></td>"
-            f"<td>{bat}</td>"
-            f"<td>{(r['last_seen_price'] or 0):.0f} р.</td>"
-            f"<td><b>~{(r['estimated_sold_price'] or 0):.0f} BYN</b></td>"
-            f"<td>{(r['days_on_market'] or 0):.1f} дн.</td>"
-            f"<td class='desc-cell'>{desc_html}</td>"
-            f"</tr>"
-        )
-
-    cur.execute("""
-        SELECT ad_id, model, memory, battery_health, district, last_seen_price,
-               price_drops_count, list_time_ts, title, description
-        FROM lot_history
-        WHERE status = 'active' AND model IS NOT NULL
-        ORDER BY last_seen_ts DESC
-        LIMIT 100
-    """)
-    active_rows = cur.fetchall()
-    active_rows_html = []
-    now_ts = time.time()
-    for r in active_rows:
-        days_now = max(0.0, (now_ts - (r["list_time_ts"] or now_ts)) / 86400.0)
-        bat = f"{r['battery_health']}%" if r["battery_health"] else "—"
-        drops = f"(-{r['price_drops_count']}x)" if (r["price_drops_count"] or 0) > 0 else ""
-        link = f"https://www.kufar.by/item/{r['ad_id']}"
-        desc_html = format_desc_for_html(r["title"], r["description"])
-        active_rows_html.append(
-            f"<tr>"
-            f"<td><a href='{link}' target='_blank'>{html.escape(r['model'])} ({r['memory']}GB)</a></td>"
-            f"<td>{bat}</td>"
-            f"<td>{html.escape(r['district'] or '—')}</td>"
-            f"<td><b>{(r['last_seen_price'] or 0):.0f} BYN</b> <span class='muted'>{drops}</span></td>"
-            f"<td>{days_now:.1f} дн.</td>"
-            f"<td class='desc-cell'>{desc_html}</td>"
-            f"</tr>"
-        )
-
-    minsk_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=3))).strftime("%d.%m.%Y %H:%M")
-
-    template = r"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kufar Sniper 3.9 — База данных</title>
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 16px; }
-  .wrap { max-width: 1280px; margin: 0 auto; }
-  h1 { font-size: 22px; margin: 0 0 6px; color: #f8fafc; }
-  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 18px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; margin-bottom: 20px; }
-  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 12px; }
-  .card .lbl { font-size: 12px; color: #94a3b8; }
-  .card .val { font-size: 22px; font-weight: 700; margin-top: 4px; color: #f8fafc; }
-  .card .val.fire { color: #fb923c; }
-  .card .val.green { color: #4ade80; }
-  .search { width: 100%; box-sizing: border-box; padding: 10px 14px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 14px; margin-bottom: 18px; }
-  h2 { font-size: 16px; margin: 22px 0 10px; color: #cbd5e1; }
-  .tbl-wrap { overflow-x: auto; background: #1e293b; border: 1px solid #334155; border-radius: 10px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid #334155; white-space: nowrap; vertical-align: top; }
-  th { background: #0f172a; color: #94a3b8; font-weight: 600; }
-  tr:hover { background: #263348; }
-  a { color: #38bdf8; text-decoration: none; }
-  .muted { color: #94a3b8; font-size: 12px; }
-  .desc-cell { white-space: normal; min-width: 240px; max-width: 420px; font-size: 12px; color: #cbd5e1; line-height: 1.35; }
-  .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-  .badge.fire { background: #7c2d12; color: #fdba74; }
-  .badge.green { background: #14532d; color: #86efac; }
-  .badge.blue { background: #1e3a8a; color: #93c5fd; }
-  .badge.gray { background: #334155; color: #cbd5e1; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>📦 База данных Kufar Sniper 3.9</h1>
-  <div class="sub">Сформировано: __NOW__ (Минск) · Фильтр продаж: коридор 55%–110% от витрины, только чистые лоты</div>
-  <div class="grid">
-    <div class="card"><div class="lbl">Всего записей</div><div class="val">__TOTAL__</div></div>
-    <div class="card"><div class="lbl">⚡ Выкуп день в день</div><div class="val fire">__SOLD_FAST__</div></div>
-    <div class="card"><div class="lbl">✅ Продажи (1–14 дн.)</div><div class="val green">__SOLD_NORM__</div></div>
-    <div class="card"><div class="lbl">Активные лоты</div><div class="val">__ACTIVE__</div></div>
-    <div class="card"><div class="lbl">🚫 Аномалии / 🗑 Снято</div><div class="val">__ANOM__ / __OVER__</div></div>
-    <div class="card"><div class="lbl">⛔ Отсеяно брака</div><div class="val">__BANNED__</div></div>
-  </div>
-  <input id="q" class="search" type="text" placeholder="🔎 Поиск по моделям, памяти, районам и словам в описании..." oninput="filterRows()">
-  <h2>📊 Рынок по моделям (Витрина 5%/35% vs Реальные продажи)</h2>
-  <div class="tbl-wrap"><table>
-    <thead><tr><th>Модель</th><th>Витрина</th><th>Реальные продажи (30 дн.)</th><th>Итоговый рынок</th><th>Ликвидность</th></tr></thead>
-    <tbody>__MODEL_ROWS__</tbody>
-  </table></div>
-  <h2>🏁 Закрытые продажи за последние 30 дней (с описаниями)</h2>
-  <div class="tbl-wrap"><table>
-    <thead><tr><th>Дата</th><th>Тип</th><th>Модель</th><th>АКБ</th><th>Цена в объявл.</th><th>Оценка с торгом</th><th>Жизнь</th><th>Описание</th></tr></thead>
-    <tbody>__SOLD_ROWS__</tbody>
-  </table></div>
-  <h2>📱 Последние 100 активных лотов</h2>
-  <div class="tbl-wrap"><table>
-    <thead><tr><th>Модель</th><th>АКБ</th><th>Район</th><th>Цена</th><th>Висит</th><th>Описание</th></tr></thead>
-    <tbody>__ACTIVE_ROWS__</tbody>
-  </table></div>
-</div>
-<script>
-function filterRows() {
-  const tokens = document.getElementById('q').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
-  document.querySelectorAll('tbody tr').forEach(tr => {
-    const txt = tr.innerText.toLowerCase();
-    const ok = tokens.every(t => txt.includes(t));
-    tr.style.display = ok ? '' : 'none';
-  });
-}
-</script>
-</body>
-</html>"""
-
-    html_doc = (
-        template
-        .replace("__NOW__", minsk_now)
-        .replace("__TOTAL__", str(total_lots))
-        .replace("__SOLD_FAST__", str(sold_fast_cnt))
-        .replace("__SOLD_NORM__", str(sold_norm_cnt))
-        .replace("__ACTIVE__", str(active_cnt))
-        .replace("__ANOM__", str(removed_anom_cnt))
-        .replace("__OVER__", str(removed_over_cnt))
-        .replace("__BANNED__", str(banned_cnt))
-        .replace("__MODEL_ROWS__", "".join(model_rows_html) or "<tr><td colspan='5'>Пока нет данных</td></tr>")
-        .replace("__SOLD_ROWS__", "".join(sold_rows_html) or "<tr><td colspan='8'>Продаж пока не зафиксировано</td></tr>")
-        .replace("__ACTIVE_ROWS__", "".join(active_rows_html) or "<tr><td colspan='6'>Активных лотов пока нет</td></tr>")
-    )
-
-    report_path = "kufar_db_report.html"
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(html_doc)
-
-    summary_stats = {
-        "total": total_lots,
-        "active": active_cnt,
-        "sold_fast": sold_fast_cnt,
-        "sold_norm": sold_norm_cnt,
-        "removed_over": removed_over_cnt,
-        "removed_anom": removed_anom_cnt,
-        "banned": banned_cnt
-    }
-    return report_path, summary_stats
+    counts = dict(db_conn.execute("SELECT status,COUNT(*) FROM lot_history GROUP BY status").fetchall())
+    stats = dict(total=sum(counts.values()), active=counts.get('active', 0), unavailable=counts.get('unavailable', 0))
+    parts = ["<!doctype html><html lang='ru'><meta charset='utf-8'><title>Kufar Sniper 4.0</title>",
+             "<style>body{font:16px sans-serif;margin:24px;background:#f4f7fa;color:#17212c}table{border-collapse:collapse;width:100%}td,th{padding:8px;border:1px solid #ccc;text-align:left}td{max-width:400px;overflow-wrap:anywhere}</style>",
+             "<h1>Kufar Sniper 4.0 — наблюдения</h1>",
+             f"<p>Всего: {stats['total']}; активны: {stats['active']}; недоступны: {stats['unavailable']}.</p>",
+             "<p>Исчезновение не подтверждает продажу. Цена сделки и срок продажи неизвестны. Старые эвристические значения сохранены отдельно в legacy-полях.</p>",
+             "<h2>Цены активных объявлений</h2><table><tr><th>Модель</th><th>Оценка, BYN</th><th>Выборка</th><th>Медианный возраст активных объявлений, дней</th></tr>"]
+    for r in db_conn.execute("SELECT * FROM market_cache ORDER BY updated_ts DESC"):
+        parts.append(f"<tr><td>{html.escape(r['cache_key'])}</td><td>{r['market_price'] or '—'}</td><td>{r['sample_size']}</td><td>{r['median_days']}</td></tr>")
+    parts.append("</table><h2>Последние 500 наблюдений</h2><table><tr><th>Объявление</th><th>Состояние</th><th>Последняя цена продавца</th><th>Последний раз активно (UTC)</th><th>Недоступность замечена (UTC)</th><th>Описание</th></tr>")
+    for r in db_conn.execute("SELECT * FROM lot_history ORDER BY COALESCE(unavailable_detected_ts,last_seen_ts) DESC LIMIT 500"):
+        def stamp(value):
+            return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M') if value else '—'
+        status = {'active':'Активно', 'unavailable':'Недоступно; причина неизвестна', 'banned':'Исключено фильтром', 'ignored':'Не подходит фильтру'}.get(r['status'], r['status'])
+        parts.append(f"<tr><td><a href='https://www.kufar.by/item/{html.escape(r['ad_id'])}'>{html.escape(r['title'] or r['ad_id'])}</a></td><td>{html.escape(status)}</td><td>{r['last_seen_price']}</td><td>{stamp(r['last_active_ts'])}</td><td>{stamp(r['unavailable_detected_ts'])}</td><td>{html.escape(r['description'] or '')}</td></tr>")
+    parts.append('</table></html>')
+    report_path = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), 'kufar_db_report.html')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(''.join(parts))
+    return report_path, stats
 
 
 def send_db_report(settings):
     try:
-        db_conn.commit()
-        db_conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-        report_path, st = generate_html_db_report(settings)
-
-        cur = db_conn.cursor()
-        cur.execute("""
-            SELECT model, memory,
-                   COUNT(*) as total_s,
-                   SUM(CASE WHEN status = 'sold_fast' THEN 1 ELSE 0 END) as fast_s,
-                   ROUND(AVG(estimated_sold_price)) as avg_p
-            FROM lot_history
-            WHERE status IN ('sold_fast', 'sold') AND model IS NOT NULL
-            GROUP BY model, memory
-            ORDER BY total_s DESC
-            LIMIT 6
-        """)
-        top_sold = cur.fetchall()
-
-        top_lines = ""
-        for r in top_sold:
-            top_lines += f"• <b>{r['model']} ({r['memory']}GB)</b>: {r['total_s']} прод. (⚡≤1д: {r['fast_s']}) — ср. ~{(r['avg_p'] or 0):.0f} BYN\n"
-
-        cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'ignored'")
-        ignored_cnt = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE description IS NOT NULL AND description != ''")
-        with_desc_cnt = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM market_cache")
-        cache_cnt = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM ml_ads")
-        ml_cnt = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM price_history")
-        ph_cnt = cur.fetchone()["c"]
-        db_size_kb = round(os.path.getsize(DB_FILE) / 1024.0, 1) if os.path.exists(DB_FILE) else 0
-
-        msg = (
-            f"📦 <b>Состояние базы данных ({db_size_kb} КБ):</b>\n\n"
-            f"• 🧠 <b>ML-датасет (ml_ads): {ml_cnt} записей</b> | Изменений цен: <b>{ph_cnt}</b>\n"
-            f"• Всего в lot_history: <b>{st['total']}</b> (с описанием: <b>{with_desc_cnt}</b>)\n"
-            f"• ⚡ Выкуплено день в день: <b>{st['sold_fast']}</b>\n"
-            f"• ✅ Продано за 1–14 дн.: <b>{st['sold_norm']}</b>\n"
-            f"• 📱 Активных сейчас: <b>{st['active']}</b>\n"
-            f"• 🚫 Аномалий (&lt;55%): <b>{st['removed_anom']}</b> | 🗑 Снято (&gt;110%/14д): <b>{st['removed_over']}</b>\n"
-            f"• ⛔ Брака: <b>{st['banned']}</b> | 🙈 Нецелевых: <b>{ignored_cnt}</b>\n"
-            f"• 📊 Моделей в кэше рынка: <b>{cache_cnt}</b>\n"
-        )
-        if top_lines:
-            msg += f"\n<b>Топ моделей по чистым продажам:</b>\n{top_lines}"
-
-        send_telegram(msg)
-        send_telegram_document(report_path, "📊 <b>Читаемый отчет по базе</b> (открой в браузере)")
-
-        tg_limit_bytes = 49 * 1000 * 1000
-        db_bytes = os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else 0
-        zip_path = "sniper_db.zip"
-        try:
-            if db_bytes <= tg_limit_bytes:
-                if not send_telegram_document(DB_FILE, "🗄 Исходный файл SQLite (<code>sniper.db</code>) для бэкапа и ML"):
-                    send_telegram("⚠️ Не удалось отправить <code>sniper.db</code> в Telegram. Забери свежий файл в GitHub Releases (<code>db-state</code>).")
-            else:
-                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-                    zf.write(DB_FILE, arcname=os.path.basename(DB_FILE))
-                zip_bytes = os.path.getsize(zip_path)
-                db_mb = db_bytes / (1024 * 1024)
-                zip_mb = zip_bytes / (1024 * 1024)
-                if zip_bytes <= tg_limit_bytes:
-                    send_telegram_document(
-                        zip_path,
-                        f"🗜 <b>Сжатый бэкап SQLite</b> (<code>sniper.db</code>: {db_mb:.1f} МБ ➡️ zip: {zip_mb:.1f} МБ)"
-                    )
-                else:
-                    db_repo = os.getenv("DB_REPO") or os.getenv("GITHUB_REPOSITORY", "")
-                    rel_link = f"https://github.com/{db_repo}/releases/tag/db-state" if db_repo else ""
-                    link_str = f"\n👉 <a href='{html.escape(rel_link)}'><b>Скачать sniper.db из GitHub Releases</b></a>" if rel_link else ""
-                    send_telegram(
-                        f"📦 База превысила лимит Telegram 50 МБ даже в zip "
-                        f"(<code>sniper.db</code>: <b>{db_mb:.1f} МБ</b>, zip: <b>{zip_mb:.1f} МБ</b>).{link_str}"
-                    )
-        finally:
-            for tmp_p in (report_path, zip_path):
-                try:
-                    if os.path.exists(tmp_p):
-                        os.remove(tmp_p)
-                except Exception:
-                    pass
-    except Exception as e:
-        send_telegram(f"⚠️ Ошибка формирования отчета по базе: <code>{html.escape(str(e))}</code>")
+        report_path, stats = generate_html_db_report(settings)
+        pending = db_conn.execute("SELECT COUNT(*) FROM notification_outbox WHERE state!='sent' AND state!='cancelled'").fetchone()[0]
+        send_telegram(f"📦 <b>База:</b> {stats['total']} записей; активны {stats['active']}; недоступны {stats['unavailable']}.\n"
+                      f"Ожидают отправки: {pending}.\nПродажи и цены сделок не подтверждены.")
+        send_telegram_document(report_path, 'Наблюдения и цены объявлений')
+        # SQLite backup gives a consistent copy even while the bot is running.
+        from state_store import make_snapshot
+        from pathlib import Path
+        snapshot = make_snapshot(Path(DB_FILE), Path(SETTINGS_FILE), Path(DB_FILE).resolve().parent / 'backups')
+        if snapshot.stat().st_size < 49_000_000:
+            send_telegram_document(str(snapshot), 'Проверенный снимок SQLite и настроек')
+        else:
+            send_telegram('Снимок больше лимита отправки. Он сохранён в каталоге backups.')
+    except Exception as exc:
+        print(f"⚠️ Отчёт: {type(exc).__name__}")
 
 
 def handle_telegram_updates(last_update_id, settings, force=False):
@@ -2076,7 +1720,7 @@ def handle_telegram_updates(last_update_id, settings, force=False):
             if text in ("/start", "/menu", "Меню"):
                 USER_WAIT_STATE["mode"] = None
                 send_telegram(
-                    "🤖 <b>Панель управления Kufar Sniper 3.9</b>\nВыбери действие на клавиатуре ниже:",
+                    "🤖 <b>Панель управления Kufar Sniper 4.0</b>\nВыбери действие на клавиатуре ниже:",
                     reply_markup=get_main_menu_keyboard()
                 )
 
@@ -2114,7 +1758,7 @@ def handle_telegram_updates(last_update_id, settings, force=False):
             elif text == "📊 Оценка / Тест-драйв":
                 USER_WAIT_STATE["mode"] = "price_check"
                 send_telegram(
-                    "🔎 <b>Узнать рынок / Последние продажи / Тест-драйв</b>\n\n"
+                    "🔎 <b>Узнать оценку / Тест цены</b>\n\n"
                     "Напиши модель и память (через пробел можешь добавить свою цену для проверки).\n"
                     "Примеры:\n"
                     "• <code>iPhone 13 128</code>\n"
@@ -2203,7 +1847,7 @@ def handle_telegram_updates(last_update_id, settings, force=False):
                 USER_WAIT_STATE["mode"] = None
 
     except Exception as e:
-        print(f"⚠️ Ошибка getUpdates: {e}")
+        print(f"⚠️ Ошибка getUpdates: {type(e).__name__}")
     return last_update_id
 
 
@@ -2227,10 +1871,10 @@ def handle_interactive_price_check(query_text, settings):
         send_telegram(f"❌ Не удалось распознать модель из белого списка ({html.escape(str(err))}). Например: <code>iPhone 13 128</code>")
         return
 
-    send_telegram(f"⏳ Сканирую витрину Куфара и базу продаж для <b>{phone_info['model']} ({phone_info['memory']} GB)</b>...")
+    send_telegram(f"⏳ Сканирую цены активных объявлений Куфара для <b>{phone_info['model']} ({phone_info['memory']} GB)</b>...")
     m_data = get_market_data(phone_info, settings, force_refresh=True)
     if not m_data:
-        send_telegram("⚠️ Слишком мало активных объявлений и продаж (меньше 3 шт.) для расчета.")
+        send_telegram("⚠️ Слишком мало активных объявлений (меньше 3 шт.) для расчета.")
         return
 
     med = m_data["price"]
@@ -2250,122 +1894,46 @@ def handle_interactive_price_check(query_text, settings):
 
     if m_data["sold_count"] > 0 and m_data["sold_median"]:
         sold_line = (
-            f"• 📊 База продаж (30 дн.): <b>~{m_data['sold_median']:.0f} BYN</b> "
+            f"• 📊 Подтверждённые сделки (30 дн.): <b>~{m_data['sold_median']:.0f} BYN</b> "
             f"({m_data['sold_count']} прод., ⚡≤1д: {m_data['fast_sold_count']}, вес {m_data['sold_weight_pct']}%)\n"
         )
     else:
-        sold_line = "• 📊 База продаж (30 дн.): <i>пока нет данных</i>\n"
-
-    liq_label = "🔥 Высокая" if m_data["median_days"] <= 3.5 else ("⏳ Средняя" if m_data["median_days"] <= 8 else "🐌 Низкая")
+        sold_line = "• 📊 Подтверждённые сделки (30 дн.): <i>пока нет данных</i>\n"
 
     resp = (
         f"📊 <b>Аналитика: {phone_info['model']} ({phone_info['memory']} GB)</b>{low_sample_warn}\n\n"
         f"{showcase_line}"
         f"{sold_line}"
-        f"• 💎 <b>Итоговый рынок: ~{med:.0f} BYN</b>{corr_note}{anc_note}\n\n"
+        f"• 💎 <b>Оценка по ценам объявлений: ~{med:.0f} BYN</b>{corr_note}{anc_note}\n\n"
         f"• 🚀 Комфортный выкуп (жир -20%): <b>до {fast_buy} BYN</b>\n"
         f"• 🤝 Потолок выкупа (-12%): <b>до {bargain_buy} BYN</b>\n"
         f"• 📉 Минимум на Куфаре сейчас: <a href='{min_link}'><b>{min_p:.0f} BYN (открыть)</b></a>\n"
-        f"• ⏱ Ликвидность: <b>{liq_label}</b> (~{m_data['median_days']} дн.)"
+        f"• ⏱ Медианный возраст выборки активных объявлений: <b>~{m_data['median_days']} дн.</b> (не срок продажи)"
     )
-
-    cur = db_conn.cursor()
-    cur.execute("""
-        SELECT status, last_seen_price, estimated_sold_price, days_on_market, battery_health, title, description, last_seen_ts
-        FROM lot_history
-        WHERE model = ? AND memory = ?
-          AND status IN ('sold_fast', 'sold')
-          AND estimated_sold_price IS NOT NULL
-          AND (has_defects IS NULL OR has_defects = 0)
-        ORDER BY last_seen_ts DESC
-        LIMIT 15
-    """, (phone_info["model"], phone_info["memory"]))
-    recent_raw = cur.fetchall()
-
-    recent_clean = []
-    for r in recent_raw:
-        ref_p = r["last_seen_price"] or r["estimated_sold_price"]
-        if showcase_p and (ref_p < showcase_p * 0.55 or ref_p > showcase_p * 1.10):
-            continue
-        recent_clean.append(r)
-        if len(recent_clean) >= 5:
-            break
-
-    if recent_clean:
-        resp += "\n\n🏁 <b>Последние реальные продажи:</b>\n"
-        for r in recent_clean:
-            dt_s = datetime.datetime.fromtimestamp(
-                r["last_seen_ts"] or 0, tz=datetime.timezone(datetime.timedelta(hours=3))
-            ).strftime("%d.%m")
-            icon = "⚡" if r["status"] == "sold_fast" else "✅"
-            bat_s = f", АКБ {r['battery_health']}%" if r["battery_health"] else ""
-            raw_d = (r["description"] or r["title"] or "").strip().replace("\n", " ")
-            desc_s = f"\n   <i>«{html.escape(raw_d[:110])}{'...' if len(raw_d) > 110 else ''}»</i>" if raw_d else ""
-            resp += (
-                f"{icon} {dt_s}: <b>{(r['last_seen_price'] or 0):.0f}р ➡️ ~{(r['estimated_sold_price'] or 0):.0f} BYN</b> "
-                f"({(r['days_on_market'] or 0):.1f} дн.{bat_s}){desc_s}\n"
-            )
 
     if user_test_price:
         diff = user_test_price - med
         if diff > 25:
             advice = f"⚠️ Твоя цена (<b>{user_test_price} BYN</b>) выше рынка на {diff:.0f} р. Рекомендую снизить до <b>{med - 10:.0f}–{med:.0f} BYN</b>."
         elif diff >= -15:
-            advice = f"✅ Твоя цена (<b>{user_test_price} BYN</b>) в рынке! Для быстрой продажи ставь <b>{med - 25:.0f} BYN</b>."
+            advice = f"✅ Твоя цена (<b>{user_test_price} BYN</b>) в рынке! Гипотеза цены для проверки спроса: <b>{med - 25:.0f} BYN</b>."
         else:
-            advice = f"🔥 Твоя цена (<b>{user_test_price} BYN</b>) ниже рынка на {abs(diff):.0f} р.! Заберут очень быстро."
+            advice = f"🔥 Твоя цена (<b>{user_test_price} BYN</b>) ниже рынка на {abs(diff):.0f} р.! Скорость продажи неизвестна."
         resp += f"\n🧪 <b>Тест-драйв твоей цены:</b>\n{advice}"
 
     send_telegram(resp)
 
 
 def send_daily_report():
-    now = int(time.time())
-    day_ago = now - 86400
-    cur = db_conn.cursor()
-
-    cur.execute("SELECT COUNT(*) as c FROM ml_ads WHERE first_seen_ts >= ?", (day_ago,))
-    new_ml_cnt = cur.fetchone()["c"]
-
-    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'sold_fast' AND last_seen_ts >= ?", (day_ago,))
-    fast_cnt = cur.fetchone()["c"]
-
-    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status = 'sold' AND last_seen_ts >= ?", (day_ago,))
-    sold_cnt = cur.fetchone()["c"]
-
-    cur.execute("SELECT COUNT(*) as c FROM lot_history WHERE status IN ('removed_overpriced', 'removed_mistake', 'removed_anomaly') AND last_seen_ts >= ?", (day_ago,))
-    removed_cnt = cur.fetchone()["c"]
-
-    cur.execute("""
-        SELECT model, memory, last_seen_price, days_on_market, estimated_sold_price, status
-        FROM lot_history
-        WHERE status IN ('sold_fast', 'sold') AND last_seen_ts >= ?
-        ORDER BY (status = 'sold_fast') DESC, last_seen_ts DESC
-        LIMIT 8
-    """, (day_ago,))
-    sold_rows = cur.fetchall()
-
-    details = ""
-    for r in sold_rows:
-        tag = "⚡" if r["status"] == "sold_fast" else "•"
-        details += (
-            f"{tag} {r['model']} ({r['memory']}GB) — висел {(r['last_seen_price'] or 0):.0f} р., "
-            f"ушел за ~{(r['days_on_market'] or 0):.1f} дн. (с торгом: ~{(r['estimated_sold_price'] or 0):.0f} р.)\n"
-        )
-
-    msg = (
-        f"📈 <b>Отчет по рынку за последние 24 часа:</b>\n\n"
-        f"📥 Новых объявлений записано в ML-базу: <b>{new_ml_cnt} шт.</b>\n"
-        f"⚡ Выкуплено день в день: <b>{fast_cnt} шт.</b>\n"
-        f"🏁 Продано за 1–14 дн.: <b>{sold_cnt} шт.</b>\n"
-        f"🗑 Отсеяно (снято / аномалии): <b>{removed_cnt} шт.</b>\n"
-    )
-    if details:
-        msg += f"\n<b>Примеры закрытых сделок:</b>\n{details}"
-    send_telegram(msg)
+    since = int(time.time()) - 86400
+    new_count = db_conn.execute('SELECT COUNT(*) FROM ml_ads WHERE first_seen_ts>=?', (since,)).fetchone()[0]
+    gone = db_conn.execute("SELECT COUNT(*) FROM availability_history WHERE observation='unavailable' AND observed_ts>=?", (since,)).fetchone()[0]
+    pending = db_conn.execute("SELECT COUNT(*) FROM notification_outbox WHERE state IN ('pending','sending')").fetchone()[0]
+    send_telegram(f"📈 <b>Наблюдения за 24 часа:</b>\nНовых объявлений: {new_count}.\n"
+                  f"Проверок с недоступностью: {gone}. Это не подтверждённые продажи.\n"
+                  f"Уведомлений в очереди: {pending}.")
 
 
-# ================= 5. ДЕТЕКТОР ПРОДАЖ (С ТРЕКИНГОМ ЦЕН) И ДАЙДЖЕСТ =================
 def check_graveyard_and_digest(settings, last_update_id):
     now = int(time.time())
     cur = db_conn.cursor()
@@ -2417,6 +1985,7 @@ def check_graveyard_and_digest(settings, last_update_id):
     for row in stale_rows:
         if not RUNNING:
             break
+        watchdog()
         last_update_id = handle_telegram_updates(last_update_id, settings)
 
         ad_id = row["ad_id"]
@@ -2436,8 +2005,8 @@ def check_graveyard_and_digest(settings, last_update_id):
             elif r.status_code == 200:
                 data = r.json()
                 res = data.get("result")
-                if not res:
-                    is_gone = True
+                if not isinstance(res, dict) or not res:
+                    raise RetryAd("invalid_item_response")
                 elif isinstance(res, dict):
                     res_dict = res
                     st = str(res.get("status") or res.get("ad_status") or "").lower()
@@ -2446,69 +2015,19 @@ def check_graveyard_and_digest(settings, last_update_id):
                     else:
                         is_alive = True
                 else:
-                    is_alive = True
+                    raise RetryAd("invalid_item_response")
             else:
                 err_cnt += 1
                 print(f"⚠️ Graveyard {ad_id}: неожиданный HTTP {r.status_code}")
 
             if is_gone:
                 gone_cnt += 1
-                ref_ts = row["list_time_ts"] or row["first_seen_ts"] or now
-                prev_seen_ts = row["last_seen_ts"] or now
-                est_gone_ts = (prev_seen_ts + now) / 2.0 if (now - prev_seen_ts) > 120 else now
-                est_gone_ts = max(est_gone_ts, ref_ts)
-                hours_lived = max(0.05, (est_gone_ts - ref_ts) / 3600.0)
-                days_lived = round(hours_lived / 24.0, 2)
-                last_p = row["last_seen_price"] or 0
-                est_sold = calculate_estimated_sold_price(last_p, days_lived)
-
-                relisted = False
-                acc_id = str(row["account_id"] or "").strip()
-                if acc_id:
-                    cur.execute("""
-                        SELECT COUNT(*) as c FROM lot_history
-                        WHERE account_id = ? AND model = ? AND ad_id != ? AND first_seen_ts > ?
-                    """, (acc_id, row["model"], ad_id, now - 48 * 3600))
-                    relisted = cur.fetchone()["c"] > 0
-
-                cache_key = f"{row['model']}_{row['memory']}GB"
-                cur.execute("SELECT market_price FROM market_cache WHERE cache_key = ?", (cache_key,))
-                mc_row = cur.fetchone()
-                showcase_ref = mc_row["market_price"] if (mc_row and mc_row["market_price"]) else None
-
-                is_anomaly_low = bool(showcase_ref and last_p < showcase_ref * 0.55)
-                is_overpriced_fast = bool(showcase_ref and days_lived <= 1.0 and last_p > showcase_ref * 1.05)
-                is_overpriced_any = bool(showcase_ref and last_p > showcase_ref * 1.10)
-
-                if hours_lived < 0.25:
-                    new_status = "removed_mistake"
-                    est_sold = None
-                elif is_anomaly_low:
-                    new_status = "removed_anomaly"
-                    est_sold = None
-                elif relisted or days_lived > 14.0 or is_overpriced_fast or is_overpriced_any:
-                    new_status = "removed_overpriced"
-                    est_sold = None
-                elif days_lived <= 1.0:
-                    new_status = "sold_fast"
-                else:
-                    new_status = "sold"
-
-                cur.execute("""
-                    UPDATE lot_history
-                    SET status = ?, days_on_market = ?, estimated_sold_price = ?, last_seen_ts = ?
-                    WHERE ad_id = ?
-                """, (new_status, round(days_lived, 1), est_sold, now, ad_id))
-
-                cur.execute("""
-                    UPDATE ml_ads
-                    SET status = ?, sold_ts = ?, days_on_market = ?, estimated_sold_price = ?, last_seen_ts = ?
-                    WHERE ad_id = ?
-                """, (new_status, int(est_gone_ts), round(days_lived, 2), est_sold, now, ad_id))
-
-                print(f"🪦 Лот {ad_id} ({row['model']} {last_p:.0f}р) -> {new_status} (HTTP {r.status_code})")
+                evidence = f"http_{r.status_code}" if r.status_code != 200 else "api_inactive"
+                mark_unavailable(db_conn, ad_id, now, evidence)
+                print(f"🪦 Лот {ad_id}: недоступен ({evidence}); факт продажи неизвестен.")
 
             elif is_alive:
+                mark_active(db_conn, ad_id, now)
                 alive_cnt += 1
                 old_p = row["last_seen_price"] or 0
                 new_p = old_p
@@ -2536,6 +2055,11 @@ def check_graveyard_and_digest(settings, last_update_id):
                         WHERE ad_id = ?
                     """, (now, new_p, drops_inc, ad_id))
                     record_price_event(cur, ad_id, new_p, now, source="graveyard")
+                    cached = cur.execute("SELECT payload FROM feed_inbox WHERE ad_id=?", (ad_id,)).fetchone()
+                    if cached:
+                        changed = json.loads(cached[0])
+                        changed['price_byn'] = str(round(new_p * 100))
+                        remember_ads(db_conn, [changed], now)
                 else:
                     cur.execute("UPDATE lot_history SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
                     cur.execute("UPDATE ml_ads SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
@@ -2543,7 +2067,7 @@ def check_graveyard_and_digest(settings, last_update_id):
             db_conn.commit()
         except Exception as e:
             err_cnt += 1
-            print(f"⚠️ Ошибка проверки {ad_id}: {e}")
+            print(f"⚠️ Ошибка проверки {ad_id}: {type(e).__name__}")
         time.sleep(0.25)
 
     # 3. Лёгкий трекинг жизненного цикла нецелевых моделей (Honor/Realme/Huawei и др.) для ML
@@ -2560,6 +2084,7 @@ def check_graveyard_and_digest(settings, last_update_id):
     for mrow in ml_other_rows:
         if not RUNNING:
             break
+        watchdog()
         last_update_id = handle_telegram_updates(last_update_id, settings)
         ad_id = mrow["ad_id"]
         try:
@@ -2570,24 +2095,18 @@ def check_graveyard_and_digest(settings, last_update_id):
             res_dict = None
             if r.status_code == 200:
                 res = r.json().get("result")
-                if not res:
-                    is_gone = True
+                if not isinstance(res, dict) or not res:
+                    raise RetryAd("invalid_item_response")
                 elif isinstance(res, dict):
                     res_dict = res
                     st = str(res.get("status") or res.get("ad_status") or "").lower()
                     if res.get("is_active") is False or st in ("deleted", "removed", "sold", "inactive", "archived", "deactivated"):
                         is_gone = True
             if is_gone:
-                ref_ts = mrow["list_time_ts"] or mrow["first_seen_ts"] or now
-                prev_ts = mrow["last_seen_ts"] or now
-                est_gone = max((prev_ts + now) / 2.0, ref_ts)
-                days_lived = round(max(0.05, (est_gone - ref_ts) / 3600.0) / 24.0, 2)
-                cur.execute("""
-                    UPDATE ml_ads
-                    SET status = 'ignored_gone', sold_ts = ?, days_on_market = ?, last_seen_ts = ?
-                    WHERE ad_id = ?
-                """, (int(est_gone), days_lived, now, ad_id))
+                evidence = f"http_{r.status_code}" if r.status_code != 200 else "api_inactive"
+                mark_unavailable(db_conn, ad_id, now, evidence)
             elif res_dict:
+                mark_active(db_conn, ad_id, now)
                 old_p = mrow["price_byn"] or 0
                 new_p = old_p
                 if res_dict.get("price_byn") is not None:
@@ -2652,28 +2171,64 @@ def check_graveyard_and_digest(settings, last_update_id):
 
 # ================= 6. ОСНОВНОЙ ПАРСЕР ЛЕНТЫ КУФАРА =================
 def get_latest_ads(settings):
-    """Сканирует широкий рынок (50..5500 BYN, 50 лотов за запрос) для полного сбора ML-базы."""
+    """Read the head every cycle and resume a bounded backfill independently.
+
+    Store each page and its next cursor atomically. Unknown/malformed responses
+    never advance the cursor. A deep overlapping sweep checks older edits too.
+    """
+    settings_revision(db_conn, settings)
+    if time.time() < float(get_meta('feed_retry_until', '0')):
+        return pending_ads(db_conn)
     min_k = min(SCAN_MIN_PRICE, int(settings.get("min_price", SCAN_MIN_PRICE))) * 100
     max_k = max(SCAN_MAX_PRICE, int(settings.get("max_price", 750))) * 100
-    url = (
-        f"https://api.kufar.by/search-api/v2/search/rendered-paginated"
-        f"?cat=17010&cmp=0&lang=ru&prc=r%3A{min_k}%2C{max_k}&rgn=7&size={FEED_PAGE_SIZE}&sort=lst.d"
-    )
-    try:
-        r = kufar_session.get(url, timeout=10)
-        if r.status_code == 200:
-            ads = r.json().get("ads", [])
-            if not ads:
-                print("⚠️ Куфар вернул HTTP 200, но список ads пустой.")
-            return ads
-        elif r.status_code == 429:
-            print("⚠️ Куфар вернул HTTP 429 (лимит запросов), пауза 25 сек...")
-            time.sleep(25)
-        else:
-            print(f"⚠️ Куфар отклонил запрос ленты: HTTP {r.status_code} | {r.text[:160]}")
-    except Exception as e:
-        print(f"⚠️ Ошибка ленты Куфара: {e}")
-    return []
+    base = ("https://api.kufar.by/search-api/v2/search/rendered-paginated"
+            f"?cat=17010&cmp=0&lang=ru&prc=r%3A{min_k}%2C{max_k}&rgn=7&size={FEED_PAGE_SIZE}&sort=lst.d")
+    saved_cursor = get_meta('feed_backfill_cursor', '')
+    cursor = None
+    max_pages = max(2, min(20, int(os.getenv('FEED_MAX_PAGES', '4'))))
+    for page_idx in range(max_pages):
+        url = base + (f"&cursor={requests.utils.quote(cursor, safe='')}" if cursor else '')
+        try:
+            response = kufar_session.get(url, timeout=10)
+            if response.status_code != 200:
+                failures = int(get_meta('feed_failures', '0')) + 1
+                set_meta('feed_failures', failures)
+                set_meta('feed_retry_until', time.time() + min(300, 15 * 2 ** min(failures, 5)))
+                if cursor and response.status_code in (400, 404, 410):
+                    set_meta('feed_backfill_cursor', '')
+                print(f"⚠️ Лента: HTTP {response.status_code}; курсор сохранён, повтор позже.")
+                break
+            data = response.json()
+            ads = data.get('ads')
+            if not isinstance(ads, list) or not isinstance(data.get('pagination'), dict):
+                raise RetryAd('invalid_feed_response')
+            next_cursor = next((p.get('token') for p in data['pagination'].get('pages', [])
+                                if p.get('label') == 'next'), None)
+            if next_cursor and next_cursor == cursor:
+                raise RetryAd('repeated_feed_cursor')
+            with db_conn:
+                remember_ads(db_conn, ads)
+                # Head and backfill are two lanes: never overwrite an unfinished
+                # backfill with a fresh head token.
+                if page_idx > 0 or not saved_cursor:
+                    db_conn.execute("INSERT OR REPLACE INTO meta VALUES ('feed_backfill_cursor',?)", (next_cursor or '',))
+                db_conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_feed_ok_ts',?)", (str(int(time.time())),))
+                db_conn.execute("INSERT OR REPLACE INTO meta VALUES ('feed_failures','0')")
+            if page_idx == 0 and saved_cursor:
+                cursor = saved_cursor
+            else:
+                cursor = next_cursor
+            if not cursor:
+                break
+            time.sleep(0.3)
+        except Exception as exc:
+            set_meta('feed_retry_until', time.time() + 30)
+            print(f"⚠️ Лента: {type(exc).__name__}; страница не подтверждена.")
+            # A cursor rejected by the server must not stall the backfill forever.
+            if 'response' in locals() and response.status_code in (400, 404, 410):
+                set_meta('feed_backfill_cursor', '')
+            break
+    return pending_ads(db_conn)
 
 
 def get_ad_details(ad_id):
@@ -2686,15 +2241,19 @@ def get_ad_details(ad_id):
         try:
             r = kufar_session.get(url, timeout=7)
             if r.status_code == 200:
-                res = r.json().get("result") or {}
-                if isinstance(res, dict):
+                res = r.json().get("result")
+                if isinstance(res, dict) and res:
+                    with db_conn:
+                        remember_detail(db_conn, str(ad_id), res)
                     return (res.get("body") or ""), res, True
-                return "", {}, True
+                return "", {}, False
             elif r.status_code == 429:
                 time.sleep(3 * (attempt + 1))
                 continue
             elif r.status_code in (404, 410):
-                return "", {}, True
+                with db_conn:
+                    mark_unavailable(db_conn, ad_id, int(time.time()), f"http_{r.status_code}")
+                return "", {"is_active": False}, True
         except Exception:
             if attempt == 0:
                 time.sleep(1)
@@ -2725,65 +2284,411 @@ def has_real_exchange_offer(text):
 
 
 # ================= ГЛАВНЫЙ ЦИКЛ =================
+def process_ad(ad, settings, last_update_id):
+    cur = db_conn.cursor()
+    now_ts = int(time.time())
+    ad_id = str(ad.get("ad_id") or "")
+    if not ad_id:
+        return last_update_id
+
+    price_byn = int(ad.get("price_byn") or 0) / 100.0
+    if price_byn <= 0:
+        return last_update_id
+    with db_conn:
+        cur.execute("UPDATE notification_outbox SET state='cancelled',last_error='price_changed' WHERE ad_id=? AND price!=? AND state='pending'", (ad_id, price_byn))
+
+    list_ts = int(parse_kufar_time(ad.get("list_time", "")))
+    days_old = max(0.0, (now_ts - list_ts) / 86400.0)
+    account_id = str(ad.get("account_id") or "")
+
+    cur.execute("SELECT * FROM lot_history WHERE ad_id = ?", (ad_id,))
+    existing = cur.fetchone()
+
+    price_drop_tag = ""
+    drops_cnt = 0
+
+    if existing:
+        ref_price = existing["last_drop_ref_price"] or existing["last_seen_price"] or price_byn
+        first_price = existing["first_seen_price"] or ref_price
+        drops_cnt = existing["price_drops_count"] or 0
+        notified_state = existing["notified"]
+
+        if price_byn < ref_price and (ref_price - price_byn) >= 5:
+            drops_cnt += 1
+            total_drop = first_price - price_byn
+            total_drop_pct = (total_drop / first_price) * 100.0 if first_price > 0 else 0
+
+            cur.execute("""
+                UPDATE lot_history
+                SET last_seen_price = ?, last_drop_ref_price = ?, price_drops_count = ?,
+                    last_seen_ts = ?, status = 'active', estimated_sold_price = NULL
+                WHERE ad_id = ?
+            """, (price_byn, price_byn, drops_cnt, now_ts, ad_id))
+            cur.execute("""
+                UPDATE ml_ads
+                SET price_byn = ?, price_drops_count = ?, last_seen_ts = ?,
+                    status = 'active', sold_ts = NULL, estimated_sold_price = NULL
+                WHERE ad_id = ?
+            """, (price_byn, drops_cnt, now_ts, ad_id))
+            record_price_event(cur, ad_id, price_byn, now_ts, source="feed_drop")
+            db_conn.commit()
+
+            if (total_drop >= 15 and total_drop_pct >= 5.0) or drops_cnt >= 2:
+                price_drop_tag = (
+                    f"🔥 <b>Продавец ломается! (Снижение #{drops_cnt})</b>\n"
+                    f"📉 История цены: {first_price:.0f} ➡️ <b>{price_byn:.0f} BYN</b> (-{total_drop:.0f} р. / -{total_drop_pct:.0f}%)\n"
+                )
+
+        else:
+            new_ref = price_byn if price_byn > ref_price else ref_price
+            if existing["status"] != "active":
+                cur.execute("""
+                    UPDATE lot_history
+                    SET last_seen_ts = ?, last_seen_price = ?, last_drop_ref_price = ?,
+                        status = 'active', estimated_sold_price = NULL, days_on_market = 0
+                    WHERE ad_id = ?
+                """, (now_ts, price_byn, new_ref, ad_id))
+                cur.execute("""
+                    UPDATE ml_ads
+                    SET last_seen_ts = ?, price_byn = ?, status = 'active',
+                        sold_ts = NULL, estimated_sold_price = NULL, days_on_market = NULL
+                    WHERE ad_id = ?
+                """, (now_ts, price_byn, ad_id))
+            else:
+                cur.execute("""
+                    UPDATE lot_history
+                    SET last_seen_ts = ?, last_seen_price = ?, last_drop_ref_price = ?
+                    WHERE ad_id = ?
+                """, (now_ts, price_byn, new_ref, ad_id))
+                cur.execute(
+                    "UPDATE ml_ads SET last_seen_ts = ?, price_byn = ? WHERE ad_id = ?",
+                    (now_ts, price_byn, ad_id)
+                )
+            record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
+            db_conn.commit()
+
+    raw_title = ad.get("subject", "Без названия")
+    ad_params = ad.get("ad_parameters", [])
+
+    title_norm, _ = normalize_phone(raw_title, "", ad_params)
+    title_model_id = title_norm["model"] if title_norm else None
+    title_phone_type = title_norm["type"] if title_norm else "apple"
+
+    title_ban_reason = check_ban_markers(raw_title, "", title_phone_type, title_model_id, ad_params)
+    if title_ban_reason:
+        cur.execute("UPDATE notification_outbox SET state='cancelled',last_error='filtered' WHERE ad_id=? AND state='pending'", (ad_id,))
+        cur.execute("""
+            INSERT INTO lot_history
+            (ad_id, account_id, model, memory, district, first_seen_price, last_seen_price, last_drop_ref_price,
+             first_seen_ts, last_seen_ts, list_time_ts, status, notified, title)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1, ?)
+            ON CONFLICT(ad_id) DO UPDATE SET
+                last_seen_ts = excluded.last_seen_ts, status = 'banned', notified = 1, title = excluded.title
+        """, (
+            ad_id, account_id, title_model_id,
+            title_norm["memory"] if title_norm else None,
+            parse_district(ad),
+            price_byn, price_byn, price_byn, now_ts, now_ts, list_ts, raw_title.strip()
+        ))
+        upsert_ml_ad(
+            cur, ad, phone_info=title_norm, status="banned", ban_reason=title_ban_reason,
+            now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+        )
+        db_conn.commit()
+        return last_update_id
+
+    description, detail_res, details_ok = get_ad_details(ad_id)
+    if not details_ok:
+        # Временный сбой API — пропускаем сейчас, чтобы повторить на следующем скане и не потерять описание
+        raise RetryAd("details_unavailable")
+
+    if detail_res.get('is_active') is False or str(detail_res.get('status') or detail_res.get('ad_status') or '').lower() in ('deleted', 'removed', 'sold', 'inactive', 'archived', 'deactivated'):
+        with db_conn:
+            mark_unavailable(db_conn, ad_id, now_ts, 'api_inactive')
+        return last_update_id
+    if detail_res.get('price_byn') is not None:
+        current_price = int(detail_res['price_byn']) / 100.0
+        if current_price <= 0:
+            return last_update_id
+        if abs(current_price - price_byn) >= 0.01:
+            refreshed = dict(ad, price_byn=str(round(current_price * 100)))
+            with db_conn:
+                remember_ads(db_conn, [refreshed])
+            raise RetryAd('asking_price_changed')
+
+    full_params = (detail_res.get("ad_parameters") if isinstance(detail_res, dict) and detail_res.get("ad_parameters") else ad_params) or []
+    full_text = f"{raw_title}\n{description}"
+
+    phone_info, norm_err = normalize_phone(raw_title, description, full_params)
+    if not phone_info:
+        box_st_other = detect_box_state(full_text)
+        color_other, _ = extract_color(raw_title, description)
+        cur.execute("""
+            INSERT INTO lot_history
+            (ad_id, account_id, district, first_seen_price, last_seen_price, last_drop_ref_price,
+             first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1, ?, ?)
+            ON CONFLICT(ad_id) DO UPDATE SET
+                last_seen_ts = excluded.last_seen_ts, status = 'ignored', notified = 1,
+                title = excluded.title, description = excluded.description
+        """, (
+            ad_id, account_id, parse_district(ad),
+            price_byn, price_byn, price_byn, now_ts, now_ts, list_ts,
+            raw_title.strip(), description.strip()
+        ))
+        upsert_ml_ad(
+            cur, ad, detail_res=detail_res, body=description, phone_info=None,
+            color_name=color_other, box_state=box_st_other,
+            status="ignored", ban_reason=norm_err,
+            now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+        )
+        db_conn.commit()
+        return last_update_id
+
+    ban_reason = check_ban_markers(raw_title, description, phone_info["type"], phone_info["model"], full_params)
+    if ban_reason:
+        cur.execute("UPDATE notification_outbox SET state='cancelled',last_error='filtered' WHERE ad_id=? AND state='pending'", (ad_id,))
+        print(f"⛔ [Бан: {ban_reason}] {raw_title}")
+        bat_ban = extract_battery_health(full_text) if phone_info["type"] == "apple" else None
+        color_ban, _ = extract_color(raw_title, description)
+        box_ban = detect_box_state(full_text)
+        cur.execute("""
+            INSERT INTO lot_history
+            (ad_id, account_id, model, memory, battery_health, district, first_seen_price, last_seen_price, last_drop_ref_price,
+             first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1, ?, ?)
+            ON CONFLICT(ad_id) DO UPDATE SET
+                model = excluded.model, memory = excluded.memory, last_seen_ts = excluded.last_seen_ts,
+                status = 'banned', notified = 1, title = excluded.title, description = excluded.description
+        """, (
+            ad_id, account_id, phone_info["model"], phone_info["memory"], bat_ban, parse_district(ad),
+            price_byn, price_byn, price_byn, now_ts, now_ts, list_ts, raw_title.strip(), description.strip()
+        ))
+        upsert_ml_ad(
+            cur, ad, detail_res=detail_res, body=description, phone_info=phone_info,
+            bat_health=bat_ban, color_name=color_ban, box_state=box_ban, has_defects=True,
+            status="banned", ban_reason=ban_reason,
+            now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+        )
+        db_conn.commit()
+        return last_update_id
+
+    bat_health = extract_battery_health(full_text) if phone_info["type"] == "apple" else None
+    color_name, color_tier = extract_color(raw_title, description)
+    box_state = detect_box_state(full_text)
+    has_box = (box_state != 0)
+    district = parse_district(ad)
+    link = ad.get("ad_link") or f"https://www.kufar.by/item/{ad_id}"
+    saved_title = raw_title.strip()
+    saved_desc = description.strip()
+
+    param_status, param_defect_note = check_ad_parameters_defects(full_params)
+    if param_status != "defect":
+        param_defect_note = None
+
+    _, _, lot_has_defects = adjust_lot_market_price(
+        1000, full_text, phone_info["type"], bat_health, color_tier, has_box, param_defect_note
+    )
+
+    cur.execute("""
+        INSERT INTO lot_history
+        (ad_id, account_id, model, memory, battery_health, color, district, has_box, has_defects,
+         first_seen_price, last_seen_price, last_drop_ref_price, price_drops_count,
+         first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'active', 0, ?, ?)
+        ON CONFLICT(ad_id) DO UPDATE SET
+            model = excluded.model,
+            memory = excluded.memory,
+            battery_health = excluded.battery_health,
+            color = excluded.color,
+            district = excluded.district,
+            has_box = excluded.has_box,
+            has_defects = excluded.has_defects,
+            last_seen_price = excluded.last_seen_price,
+            last_drop_ref_price = excluded.last_drop_ref_price,
+            last_seen_ts = excluded.last_seen_ts,
+            title = excluded.title,
+            description = excluded.description,
+            status = 'active',
+            estimated_sold_price = NULL
+    """, (ad_id, account_id, phone_info["model"], phone_info["memory"], bat_health, color_name,
+          district, 1 if has_box else 0, 1 if lot_has_defects else 0,
+          price_byn, price_byn, price_byn, now_ts, now_ts, list_ts,
+          saved_title, saved_desc))
+
+    upsert_ml_ad(
+        cur, ad, detail_res=detail_res, body=description, phone_info=phone_info,
+        bat_health=bat_health, color_name=color_name, box_state=box_state, has_defects=lot_has_defects,
+        status="active", ban_reason=None,
+        now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
+    )
+    mark_active(db_conn, ad_id, now_ts)
+    db_conn.commit()
+
+    m_data = get_market_data(phone_info, settings)
+    if not m_data:
+        raise RetryAd("market_data_unavailable")
+
+    if price_byn < settings.get("min_price", 120) or price_byn > settings.get("max_price", 750):
+        print(f"💼 [В базу, вне бюджета TG ({settings['min_price']}–{settings['max_price']}): {price_byn:.0f} р.] {phone_info['key']}")
+        return last_update_id
+
+    base_market = m_data["price"]
+    adj_market, cond_note, has_defects = adjust_lot_market_price(
+        base_market, full_text, phone_info["type"], bat_health, color_tier, has_box, param_defect_note
+    )
+
+    profit_byn = adj_market - price_byn
+    profit_pct = (profit_byn / adj_market) * 100.0 if adj_market > 0 else 0.0
+
+    selected_dists = settings.get("districts", [])
+    outside_district_tag = ""
+    if selected_dists:
+        in_selected = any(d.lower() in district.lower() for d in selected_dists)
+        if not in_selected:
+            if profit_byn > 30:
+                outside_district_tag = "📍 <b>Вне твоего района</b>\n"
+            else:
+                print(f"🗺 [Пропуск по району: {district}, выгода {profit_byn:+.0f} <= 30] {phone_info['key']}")
+                return last_update_id
+
+    matched_urgent = []
+    for u_pat in URGENT_PATTERNS:
+        m_u = re.search(u_pat, clean_text(full_text))
+        if m_u:
+            matched_urgent.append(m_u.group(0))
+    is_urgent = len(matched_urgent) > 0
+
+    is_scam_suspect = profit_pct >= 50.0
+    with_sound = False
+
+    if is_scam_suspect:
+        tier_header = "⚠️ <b>ПОДОЗРИТЕЛЬНО ДЕШЕВО (&gt;50% ниже рынка — возможен скам/труп на фото)</b>"
+        with_sound = False
+    elif profit_byn >= settings["fat_profit_byn"] or profit_pct >= settings["fat_profit_pct"] or (is_urgent and profit_byn >= settings["urgent_profit_byn"]):
+        tier_header = "🚨🔥 <b>ЖИРНЫЙ ЛОТ! (ЗВОНИ ПЕРВЫМ)</b> 🔥🚨"
+        with_sound = True
+    elif profit_byn >= settings["work_profit_byn"]:
+        tier_header = "🟢 <b>РАБОЧИЙ ВАРИАНТ (Хорошая маржа)</b>"
+        with_sound = False
+    elif profit_byn >= settings.get("inspect_min_profit", 15) and not has_defects:
+        tier_header = "👀 <b>ПОД ОСМОТР (Чистый лот в плюсе)</b>"
+        with_sound = False
+    else:
+        print(f"📉 [Мало выгоды: {profit_byn:+.0f} BYN] {phone_info['key']} за {price_byn:.0f} р. (Рынок ~{adj_market} р.)")
+        return last_update_id
+
+    tags = []
+    if phone_info["model"].startswith("iPhone 13") and bat_health == 100:
+        tags.append("⚠️ <b>Проверь 100% АКБ</b>")
+
+    if m_data["sample_size"] < 8 and m_data["sold_count"] < 6:
+        tags.append(f"⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>")
+
+    if days_old >= 14 and "торг" in clean_text(full_text):
+        tags.append(f"💤 <b>Висяк ({days_old:.0f} дн. + торг)</b>")
+
+    if has_real_exchange_offer(full_text):
+        tags.append("🔄 Возможен обмен")
+
+    if any(re.search(p, clean_text(full_text)) for p in NLP_TRAP_PATTERNS):
+        tags.append("⚠️ <b>Скрытый нюанс («все работает, НО...»)</b>")
+
+    images = ad.get("images", [])
+    if not images:
+        tags.append("📸 <b>БЕЗ ФОТО</b>")
+
+    if phone_info["is_assumed_mem"]:
+        tags.append(f"ℹ️ Память по низу ({phone_info['memory']}GB)")
+
+    photo_url = f"https://rms.kufar.by/v1/gallery/{images[0]['path']}" if (images and "path" in images[0]) else None
+
+    safe_title = html.escape(raw_title)
+    safe_link = html.escape(link)
+
+    bat_str = f" | 🔋 АКБ: <b>{bat_health}%</b>" if bat_health else ""
+    corr_str = " <i>(корреляция памяти)</i>" if m_data["is_correlated"] else ""
+    anc_str = " ⚓" if m_data.get("is_anchored") else ""
+
+    if m_data["showcase_price"] is not None:
+        showcase_line = f"📐 Формула (витрина 5%/35%): <b>~{m_data['showcase_price']:.0f} BYN</b> (n={m_data['sample_size']})"
+    else:
+        showcase_line = f"📐 Витрина: <i>мало объявлений (n={m_data['sample_size']})</i>"
+
+    if m_data["sold_median"] and m_data["sold_count"] > 0:
+        ml_line = (
+            f"📊 Подтверждённые сделки (30 дн.): <b>~{m_data['sold_median']:.0f} BYN</b> "
+            f"({m_data['sold_count']} прод., ⚡≤1д: {m_data['fast_sold_count']}, вес {m_data['sold_weight_pct']}%)"
+        )
+    else:
+        ml_line = "📊 Подтверждённые сделки (30 дн.): <i>пока нет данных</i>"
+
+    msg_head = f"{tier_header}\n{outside_district_tag}{price_drop_tag}"
+    if is_urgent:
+        msg_head += f"⚡ Срочность: <b>{', '.join(matched_urgent).upper()}</b>\n"
+
+    msg_head += (
+        f"📱 <b>{phone_info['model']} ({phone_info['memory']} GB)</b>{bat_str}\n"
+        f"🏷 {safe_title}\n"
+        f"📍 Район: <b>Минск ({html.escape(district)})</b>\n"
+    )
+    if tags:
+        msg_head += f"🏷 Теги: {' | '.join(tags)}\n"
+
+    msg_head += (
+        f"\n💰 Цена продавца: <b>{price_byn:.0f} BYN</b>\n"
+        f"{showcase_line}\n"
+        f"{ml_line}\n"
+        f"💎 Оценка по ценам объявлений: <b>~{adj_market} BYN</b>{corr_str}{anc_str}\n"
+        f"🛠 Коррекция: <i>{cond_note}</i>\n"
+        f"💵 Разница с оценкой (до расходов): <b>{profit_byn:+.0f} BYN ({profit_pct:+.0f}%)</b>\n"
+        f"⏱ Медианный возраст выборки активных объявлений: <b>~{m_data['median_days']} дн.</b>\n"
+    )
+    msg_foot = f"\n👉 <a href='{safe_link}'><b>ОТКРЫТЬ ОБЪЯВЛЕНИЕ НА КУФАРЕ</b></a>"
+
+    raw_desc = description.strip()
+    msg_desc = ""
+    if raw_desc:
+        base_len = visible_html_len(msg_head + msg_foot)
+        max_desc_len = min(260, max(0, 990 - base_len))
+        if max_desc_len >= 25:
+            clipped = raw_desc[:max_desc_len] + ("..." if len(raw_desc) > max_desc_len else "")
+            msg_desc = f"\n📝 <i>{html.escape(clipped)}</i>\n"
+
+    msg = msg_head + msg_desc + msg_foot
+
+    with db_conn:
+        queue_notification(db_conn, ad_id, price_byn, msg, photo_url, with_sound)
+    return last_update_id
+
+
 def main():
     settings = load_settings()
+    settings_revision(db_conn, settings)
 
     start_time = time.time()
     max_seconds = MAX_RUN_HOURS * 3600
     last_update_id = init_telegram_update_id()
     cur = db_conn.cursor()
 
-    cur.execute("SELECT COUNT(*) as c FROM lot_history")
-    if cur.fetchone()["c"] == 0:
-        initial_ads = get_latest_ads(settings)
-        now_ts = int(time.time())
-        for ad in initial_ads:
-            ad_id = str(ad.get("ad_id") or "")
-            p_byn = int(ad.get("price_byn") or 0) / 100.0
-            list_ts = int(parse_kufar_time(ad.get("list_time", "")))
-            if ad_id and p_byn > 0:
-                raw_title = ad.get("subject", "")
-                ad_params = ad.get("ad_parameters", [])
-                norm_init, _ = normalize_phone(raw_title, "", ad_params)
-                cur.execute("""
-                    INSERT OR IGNORE INTO lot_history
-                    (ad_id, account_id, model, memory, district, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1, ?)
-                """, (
-                    ad_id, str(ad.get("account_id") or ""),
-                    norm_init["model"] if norm_init else None,
-                    norm_init["memory"] if norm_init else None,
-                    parse_district(ad),
-                    p_byn, p_byn, p_byn, now_ts, now_ts, list_ts, raw_title.strip()
-                ))
-                upsert_ml_ad(
-                    cur, ad, phone_info=norm_init, status="ignored",
-                    ban_reason="cold_start_seed", now_ts=now_ts, price_byn=p_byn, list_ts=list_ts
-                )
-        db_conn.commit()
-        send_telegram(
-            f"🚀 <b>Kufar Sniper 3.9 запущен!</b>\n"
-            f"🧠 Сбор ML-базы: {SCAN_MIN_PRICE}–{SCAN_MAX_PRICE} BYN | Уведомления до {settings['max_price']} BYN",
-            with_sound=False,
-            reply_markup=get_main_menu_keyboard()
-        )
-
     cur.execute("SELECT COUNT(*) as c FROM ml_ads")
     ml_start_cnt = cur.fetchone()["c"]
     cur.execute("SELECT COUNT(*) as c FROM lot_history")
     lot_start_cnt = cur.fetchone()["c"]
     print(
-        f"🚀 Мониторинг Kufar 3.9 активен | В базе сейчас: lot_history={lot_start_cnt}, ml_ads={ml_start_cnt} | "
+        f"🚀 Мониторинг Kufar 4.0 активен | В базе сейчас: lot_history={lot_start_cnt}, ml_ads={ml_start_cnt} | "
         f"Сбор: {SCAN_MIN_PRICE}–{max(SCAN_MAX_PRICE, settings['max_price'])} BYN, TG: {settings['min_price']}–{settings['max_price']} BYN."
     )
 
     next_kufar_scan_ts = 0.0
     next_graveyard_check_ts = time.time() + 60.0
 
-    while RUNNING and (time.time() - start_time) < max_seconds:
+    while RUNNING and (MAX_RUN_HOURS <= 0 or (time.time() - start_time) < max_seconds):
+        watchdog()
         last_update_id = handle_telegram_updates(last_update_id, settings)
 
+        drain_outbox(db_conn, send_notification)
+        set_meta('heartbeat_ts', int(time.time()))
         now_f = time.time()
 
         if now_f >= next_graveyard_check_ts:
@@ -2799,380 +2704,24 @@ def main():
         ads = get_latest_ads(settings)
         now_ts = int(time.time())
 
-        for ad in reversed(ads):
+        batch_deadline = time.monotonic() + 30
+        for ad in ads[:max(1,min(25,int(os.getenv('PROCESS_BATCH_SIZE','10'))))]:
             if not RUNNING:
                 break
+            watchdog()
             last_update_id = handle_telegram_updates(last_update_id, settings)
-
-            ad_id = str(ad.get("ad_id") or "")
-            if not ad_id:
-                continue
-
-            price_byn = int(ad.get("price_byn") or 0) / 100.0
-            if price_byn <= 0:
-                continue
-
-            list_ts = int(parse_kufar_time(ad.get("list_time", "")))
-            days_old = max(0.0, (now_ts - list_ts) / 86400.0)
-            account_id = str(ad.get("account_id") or "")
-
-            cur.execute("SELECT * FROM lot_history WHERE ad_id = ?", (ad_id,))
-            existing = cur.fetchone()
-
-            price_drop_tag = ""
-            drops_cnt = 0
-
-            if existing:
-                # Даже для ignored/banned фиксируем изменение цены в ML-базе
-                if existing["status"] in ("banned", "ignored"):
-                    old_p = existing["last_seen_price"] or price_byn
-                    if abs(old_p - price_byn) >= 1.0:
-                        cur.execute("UPDATE lot_history SET last_seen_price = ?, last_seen_ts = ? WHERE ad_id = ?", (price_byn, now_ts, ad_id))
-                        cur.execute("UPDATE ml_ads SET price_byn = ?, last_seen_ts = ? WHERE ad_id = ?", (price_byn, now_ts, ad_id))
-                        record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
-                        db_conn.commit()
-                    continue
-
-                ref_price = existing["last_drop_ref_price"] or existing["last_seen_price"] or price_byn
-                first_price = existing["first_seen_price"] or ref_price
-                drops_cnt = existing["price_drops_count"] or 0
-                notified_state = existing["notified"]
-
-                if price_byn < ref_price and (ref_price - price_byn) >= 5:
-                    drops_cnt += 1
-                    total_drop = first_price - price_byn
-                    total_drop_pct = (total_drop / first_price) * 100.0 if first_price > 0 else 0
-
-                    cur.execute("""
-                        UPDATE lot_history
-                        SET last_seen_price = ?, last_drop_ref_price = ?, price_drops_count = ?,
-                            last_seen_ts = ?, status = 'active', estimated_sold_price = NULL
-                        WHERE ad_id = ?
-                    """, (price_byn, price_byn, drops_cnt, now_ts, ad_id))
-                    cur.execute("""
-                        UPDATE ml_ads
-                        SET price_byn = ?, price_drops_count = ?, last_seen_ts = ?,
-                            status = 'active', sold_ts = NULL, estimated_sold_price = NULL
-                        WHERE ad_id = ?
-                    """, (price_byn, drops_cnt, now_ts, ad_id))
-                    record_price_event(cur, ad_id, price_byn, now_ts, source="feed_drop")
-                    db_conn.commit()
-
-                    if (total_drop >= 15 and total_drop_pct >= 5.0) or drops_cnt >= 2:
-                        price_drop_tag = (
-                            f"🔥 <b>Продавец ломается! (Снижение #{drops_cnt})</b>\n"
-                            f"📉 История цены: {first_price:.0f} ➡️ <b>{price_byn:.0f} BYN</b> (-{total_drop:.0f} р. / -{total_drop_pct:.0f}%)\n"
-                        )
-                    elif notified_state == 1:
-                        continue
-                else:
-                    new_ref = price_byn if price_byn > ref_price else ref_price
-                    if existing["status"] != "active":
-                        cur.execute("""
-                            UPDATE lot_history
-                            SET last_seen_ts = ?, last_seen_price = ?, last_drop_ref_price = ?,
-                                status = 'active', estimated_sold_price = NULL, days_on_market = 0
-                            WHERE ad_id = ?
-                        """, (now_ts, price_byn, new_ref, ad_id))
-                        cur.execute("""
-                            UPDATE ml_ads
-                            SET last_seen_ts = ?, price_byn = ?, status = 'active',
-                                sold_ts = NULL, estimated_sold_price = NULL, days_on_market = NULL
-                            WHERE ad_id = ?
-                        """, (now_ts, price_byn, ad_id))
-                    else:
-                        cur.execute("""
-                            UPDATE lot_history
-                            SET last_seen_ts = ?, last_seen_price = ?, last_drop_ref_price = ?
-                            WHERE ad_id = ?
-                        """, (now_ts, price_byn, new_ref, ad_id))
-                        cur.execute(
-                            "UPDATE ml_ads SET last_seen_ts = ?, price_byn = ? WHERE ad_id = ?",
-                            (now_ts, price_byn, ad_id)
-                        )
-                    record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
-                    db_conn.commit()
-                    continue
-
-            raw_title = ad.get("subject", "Без названия")
-            ad_params = ad.get("ad_parameters", [])
-
-            title_norm, _ = normalize_phone(raw_title, "", ad_params)
-            title_model_id = title_norm["model"] if title_norm else None
-            title_phone_type = title_norm["type"] if title_norm else "apple"
-
-            title_ban_reason = check_ban_markers(raw_title, "", title_phone_type, title_model_id, ad_params)
-            if title_ban_reason:
-                cur.execute("""
-                    INSERT INTO lot_history
-                    (ad_id, account_id, model, memory, district, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1, ?)
-                    ON CONFLICT(ad_id) DO UPDATE SET
-                        last_seen_ts = excluded.last_seen_ts, status = 'banned', notified = 1, title = excluded.title
-                """, (
-                    ad_id, account_id, title_model_id,
-                    title_norm["memory"] if title_norm else None,
-                    parse_district(ad),
-                    price_byn, price_byn, price_byn, now_ts, now_ts, list_ts, raw_title.strip()
-                ))
-                upsert_ml_ad(
-                    cur, ad, phone_info=title_norm, status="banned", ban_reason=title_ban_reason,
-                    now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
-                )
-                db_conn.commit()
-                continue
-
-            description, detail_res, details_ok = get_ad_details(ad_id)
-            if not details_ok:
-                # Временный сбой API — пропускаем сейчас, чтобы повторить на следующем скане и не потерять описание
-                print(f"⚠️ Не удалось получить описание {ad_id}, повторим в следующем цикле.")
-                continue
-
-            full_params = (detail_res.get("ad_parameters") if isinstance(detail_res, dict) and detail_res.get("ad_parameters") else ad_params) or []
-            full_text = f"{raw_title}\n{description}"
-
-            phone_info, norm_err = normalize_phone(raw_title, description, full_params)
-            if not phone_info:
-                box_st_other = detect_box_state(full_text)
-                color_other, _ = extract_color(raw_title, description)
-                cur.execute("""
-                    INSERT INTO lot_history
-                    (ad_id, account_id, district, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ignored', 1, ?, ?)
-                    ON CONFLICT(ad_id) DO UPDATE SET
-                        last_seen_ts = excluded.last_seen_ts, status = 'ignored', notified = 1,
-                        title = excluded.title, description = excluded.description
-                """, (
-                    ad_id, account_id, parse_district(ad),
-                    price_byn, price_byn, price_byn, now_ts, now_ts, list_ts,
-                    raw_title.strip(), description.strip()
-                ))
-                upsert_ml_ad(
-                    cur, ad, detail_res=detail_res, body=description, phone_info=None,
-                    color_name=color_other, box_state=box_st_other,
-                    status="ignored", ban_reason=norm_err,
-                    now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
-                )
-                db_conn.commit()
-                continue
-
-            ban_reason = check_ban_markers(raw_title, description, phone_info["type"], phone_info["model"], full_params)
-            if ban_reason:
-                print(f"⛔ [Бан: {ban_reason}] {raw_title}")
-                bat_ban = extract_battery_health(full_text) if phone_info["type"] == "apple" else None
-                color_ban, _ = extract_color(raw_title, description)
-                box_ban = detect_box_state(full_text)
-                cur.execute("""
-                    INSERT INTO lot_history
-                    (ad_id, account_id, model, memory, battery_health, district, first_seen_price, last_seen_price, last_drop_ref_price,
-                     first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'banned', 1, ?, ?)
-                    ON CONFLICT(ad_id) DO UPDATE SET
-                        model = excluded.model, memory = excluded.memory, last_seen_ts = excluded.last_seen_ts,
-                        status = 'banned', notified = 1, title = excluded.title, description = excluded.description
-                """, (
-                    ad_id, account_id, phone_info["model"], phone_info["memory"], bat_ban, parse_district(ad),
-                    price_byn, price_byn, price_byn, now_ts, now_ts, list_ts, raw_title.strip(), description.strip()
-                ))
-                upsert_ml_ad(
-                    cur, ad, detail_res=detail_res, body=description, phone_info=phone_info,
-                    bat_health=bat_ban, color_name=color_ban, box_state=box_ban, has_defects=True,
-                    status="banned", ban_reason=ban_reason,
-                    now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
-                )
-                db_conn.commit()
-                continue
-
-            bat_health = extract_battery_health(full_text) if phone_info["type"] == "apple" else None
-            color_name, color_tier = extract_color(raw_title, description)
-            box_state = detect_box_state(full_text)
-            has_box = (box_state != 0)
-            district = parse_district(ad)
-            link = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
-            saved_title = raw_title.strip()
-            saved_desc = description.strip()
-
-            param_status, param_defect_note = check_ad_parameters_defects(full_params)
-            if param_status != "defect":
-                param_defect_note = None
-
-            _, _, lot_has_defects = adjust_lot_market_price(
-                1000, full_text, phone_info["type"], bat_health, color_tier, has_box, param_defect_note
-            )
-
-            cur.execute("""
-                INSERT INTO lot_history
-                (ad_id, account_id, model, memory, battery_health, color, district, has_box, has_defects,
-                 first_seen_price, last_seen_price, last_drop_ref_price, price_drops_count,
-                 first_seen_ts, last_seen_ts, list_time_ts, status, notified, title, description)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'active', 0, ?, ?)
-                ON CONFLICT(ad_id) DO UPDATE SET
-                    model = excluded.model,
-                    memory = excluded.memory,
-                    battery_health = excluded.battery_health,
-                    color = excluded.color,
-                    district = excluded.district,
-                    has_box = excluded.has_box,
-                    has_defects = excluded.has_defects,
-                    last_seen_price = excluded.last_seen_price,
-                    last_drop_ref_price = excluded.last_drop_ref_price,
-                    last_seen_ts = excluded.last_seen_ts,
-                    title = excluded.title,
-                    description = excluded.description,
-                    status = 'active',
-                    estimated_sold_price = NULL
-            """, (ad_id, account_id, phone_info["model"], phone_info["memory"], bat_health, color_name,
-                  district, 1 if has_box else 0, 1 if lot_has_defects else 0,
-                  price_byn, price_byn, price_byn, now_ts, now_ts, list_ts,
-                  saved_title, saved_desc))
-
-            upsert_ml_ad(
-                cur, ad, detail_res=detail_res, body=description, phone_info=phone_info,
-                bat_health=bat_health, color_name=color_name, box_state=box_state, has_defects=lot_has_defects,
-                status="active", ban_reason=None,
-                now_ts=now_ts, price_byn=price_byn, list_ts=list_ts
-            )
-            db_conn.commit()
-
-            m_data = get_market_data(phone_info, settings)
-            if not m_data:
-                print(f"🔇 [Мало данных: n < {MIN_VALID_SAMPLE}] {phone_info['key']}")
-                continue
-
-            if price_byn < settings.get("min_price", 120) or price_byn > settings.get("max_price", 750):
-                print(f"💼 [В базу, вне бюджета TG ({settings['min_price']}–{settings['max_price']}): {price_byn:.0f} р.] {phone_info['key']}")
-                continue
-
-            base_market = m_data["price"]
-            adj_market, cond_note, has_defects = adjust_lot_market_price(
-                base_market, full_text, phone_info["type"], bat_health, color_tier, has_box, param_defect_note
-            )
-
-            profit_byn = adj_market - price_byn
-            profit_pct = (profit_byn / adj_market) * 100.0 if adj_market > 0 else 0.0
-
-            selected_dists = settings.get("districts", [])
-            outside_district_tag = ""
-            if selected_dists:
-                in_selected = any(d.lower() in district.lower() for d in selected_dists)
-                if not in_selected:
-                    if profit_byn > 30:
-                        outside_district_tag = "📍 <b>Вне твоего района</b>\n"
-                    else:
-                        print(f"🗺 [Пропуск по району: {district}, выгода {profit_byn:+.0f} <= 30] {phone_info['key']}")
-                        continue
-
-            matched_urgent = []
-            for u_pat in URGENT_PATTERNS:
-                m_u = re.search(u_pat, clean_text(full_text))
-                if m_u:
-                    matched_urgent.append(m_u.group(0))
-            is_urgent = len(matched_urgent) > 0
-
-            is_scam_suspect = profit_pct >= 50.0
-            with_sound = False
-
-            if is_scam_suspect:
-                tier_header = "⚠️ <b>ПОДОЗРИТЕЛЬНО ДЕШЕВО (&gt;50% ниже рынка — возможен скам/труп на фото)</b>"
-                with_sound = False
-            elif profit_byn >= settings["fat_profit_byn"] or profit_pct >= settings["fat_profit_pct"] or (is_urgent and profit_byn >= settings["urgent_profit_byn"]):
-                tier_header = "🚨🔥 <b>ЖИРНЫЙ ЛОТ! (ЗВОНИ ПЕРВЫМ)</b> 🔥🚨"
-                with_sound = True
-            elif profit_byn >= settings["work_profit_byn"]:
-                tier_header = "🟢 <b>РАБОЧИЙ ВАРИАНТ (Хорошая маржа)</b>"
-                with_sound = False
-            elif profit_byn >= settings.get("inspect_min_profit", 15) and not has_defects:
-                tier_header = "👀 <b>ПОД ОСМОТР (Чистый лот в плюсе)</b>"
-                with_sound = False
-            else:
-                print(f"📉 [Мало выгоды: {profit_byn:+.0f} BYN] {phone_info['key']} за {price_byn:.0f} р. (Рынок ~{adj_market} р.)")
-                continue
-
-            tags = []
-            if phone_info["model"].startswith("iPhone 13") and bat_health == 100:
-                tags.append("⚠️ <b>Проверь 100% АКБ</b>")
-
-            if m_data["sample_size"] < 8 and m_data["sold_count"] < 6:
-                tags.append(f"⚠️ <b>Мало данных для рынка (n={m_data['sample_size']})</b>")
-
-            if days_old >= 14 and "торг" in clean_text(full_text):
-                tags.append(f"💤 <b>Висяк ({days_old:.0f} дн. + торг)</b>")
-
-            if has_real_exchange_offer(full_text):
-                tags.append("🔄 Возможен обмен")
-
-            if any(re.search(p, clean_text(full_text)) for p in NLP_TRAP_PATTERNS):
-                tags.append("⚠️ <b>Скрытый нюанс («все работает, НО...»)</b>")
-
-            images = ad.get("images", [])
-            if not images:
-                tags.append("📸 <b>БЕЗ ФОТО</b>")
-
-            if phone_info["is_assumed_mem"]:
-                tags.append(f"ℹ️ Память по низу ({phone_info['memory']}GB)")
-
-            photo_url = f"https://rms.kufar.by/v1/gallery/{images[0]['path']}" if (images and "path" in images[0]) else None
-
-            safe_title = html.escape(raw_title)
-            safe_link = html.escape(link)
-
-            bat_str = f" | 🔋 АКБ: <b>{bat_health}%</b>" if bat_health else ""
-            corr_str = " <i>(корреляция памяти)</i>" if m_data["is_correlated"] else ""
-            anc_str = " ⚓" if m_data.get("is_anchored") else ""
-
-            if m_data["showcase_price"] is not None:
-                showcase_line = f"📐 Формула (витрина 5%/35%): <b>~{m_data['showcase_price']:.0f} BYN</b> (n={m_data['sample_size']})"
-            else:
-                showcase_line = f"📐 Витрина: <i>мало объявлений (n={m_data['sample_size']})</i>"
-
-            if m_data["sold_median"] and m_data["sold_count"] > 0:
-                ml_line = (
-                    f"📊 База продаж (30 дн.): <b>~{m_data['sold_median']:.0f} BYN</b> "
-                    f"({m_data['sold_count']} прод., ⚡≤1д: {m_data['fast_sold_count']}, вес {m_data['sold_weight_pct']}%)"
-                )
-            else:
-                ml_line = "📊 База продаж (30 дн.): <i>пока нет данных</i>"
-
-            msg_head = f"{tier_header}\n{outside_district_tag}{price_drop_tag}"
-            if is_urgent:
-                msg_head += f"⚡ Срочность: <b>{', '.join(matched_urgent).upper()}</b>\n"
-
-            msg_head += (
-                f"📱 <b>{phone_info['model']} ({phone_info['memory']} GB)</b>{bat_str}\n"
-                f"🏷 {safe_title}\n"
-                f"📍 Район: <b>Минск ({html.escape(district)})</b>\n"
-            )
-            if tags:
-                msg_head += f"🏷 Теги: {' | '.join(tags)}\n"
-
-            msg_head += (
-                f"\n💰 Цена продавца: <b>{price_byn:.0f} BYN</b>\n"
-                f"{showcase_line}\n"
-                f"{ml_line}\n"
-                f"💎 Итоговый рынок экземпляра: <b>~{adj_market} BYN</b>{corr_str}{anc_str}\n"
-                f"🛠 Коррекция: <i>{cond_note}</i>\n"
-                f"💵 Чистая выгода: <b>{profit_byn:+.0f} BYN ({profit_pct:+.0f}%)</b>\n"
-                f"⏱ Ликвидность: <b>~{m_data['median_days']} дн.</b>\n"
-            )
-            msg_foot = f"\n👉 <a href='{safe_link}'><b>ОТКРЫТЬ ОБЪЯВЛЕНИЕ НА КУФАРЕ</b></a>"
-
-            raw_desc = description.strip()
-            msg_desc = ""
-            if raw_desc:
-                base_len = visible_html_len(msg_head + msg_foot)
-                max_desc_len = min(260, max(0, 990 - base_len))
-                if max_desc_len >= 25:
-                    clipped = raw_desc[:max_desc_len] + ("..." if len(raw_desc) > max_desc_len else "")
-                    msg_desc = f"\n📝 <i>{html.escape(clipped)}</i>\n"
-
-            msg = msg_head + msg_desc + msg_foot
-
-            if send_telegram(msg, photo_url, with_sound=with_sound):
-                cur.execute("UPDATE lot_history SET notified = 1 WHERE ad_id = ?", (ad_id,))
-                db_conn.commit()
-                print(f"✅ ОТПРАВЛЕНО [{phone_info['key']}]: {price_byn:.0f} BYN (Рынок ~{adj_market} BYN | Выгода {profit_byn:+.0f})")
+            set_meta('heartbeat_ts', int(time.time()))
+            try:
+                last_update_id = process_ad(ad, settings, last_update_id)
+                finish_ad(db_conn, str(ad['ad_id']))
+            except Exception as exc:
+                db_conn.rollback()
+                finish_ad(db_conn, str(ad['ad_id']), type(exc).__name__ + (':' + str(exc) if isinstance(exc, RetryAd) else ''))
+                print(f"⚠️ Лот {ad.get('ad_id')}: {type(exc).__name__}; остаётся в очереди.")
+            drain_outbox(db_conn, send_notification, limit=1)
+            if time.monotonic() >= batch_deadline:
+                break
+        set_meta('heartbeat_ts', int(time.time()))
 
     close_db()
     print("🔄 Смена завершена корректно.")

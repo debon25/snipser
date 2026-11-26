@@ -1,0 +1,17 @@
+[Unit]
+Description=Verify an hourly SQLite snapshot
+After=kufar-sniper.service
+
+[Service]
+Type=oneshot
+User=kufar
+Group=kufar
+WorkingDirectory=/opt/kufar-sniper/current
+EnvironmentFile=/etc/kufar-sniper.env
+ExecStart=/opt/kufar-sniper/current/.venv/bin/python state_store.py snapshot --output /var/lib/kufar-sniper/backups
+ExecStart=/opt/kufar-sniper/current/.venv/bin/python state_store.py prune-local --output /var/lib/kufar-sniper/backups
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kufar-sniper

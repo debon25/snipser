@@ -1,0 +1,51 @@
+test_bad_restore_does_not_touch_existing_database (test_reliability.ScenarioTests.test_bad_restore_does_not_touch_existing_database) ... ok
+test_crash_during_send_is_explicitly_recovered (test_reliability.ScenarioTests.test_crash_during_send_is_explicitly_recovered) ... ok
+test_data_audit_is_read_only (test_reliability.ScenarioTests.test_data_audit_is_read_only) ... ok
+test_existing_public_release_roundtrip_via_gh_adapter (test_reliability.ScenarioTests.test_existing_public_release_roundtrip_via_gh_adapter) ... ok
+test_failed_readback_is_not_committed (test_reliability.ScenarioTests.test_failed_readback_is_not_committed) ... ok
+test_failed_send_survives_restart_then_sends_once (test_reliability.ScenarioTests.test_failed_send_survives_restart_then_sends_once) ... ok
+test_failed_shift_blocks_stale_state_until_explicit_recovery (test_reliability.ScenarioTests.test_failed_shift_blocks_stale_state_until_explicit_recovery) ... ok
+test_graveyard_404_records_observation_without_transaction_price (test_reliability.ScenarioTests.test_graveyard_404_records_observation_without_transaction_price) ... ok
+test_graveyard_malformed_200_does_not_mark_sold_or_gone (test_reliability.ScenarioTests.test_graveyard_malformed_200_does_not_mark_sold_or_gone) ... ok
+test_history_deletion_blocks_snapshot_even_if_file_grows (test_reliability.ScenarioTests.test_history_deletion_blocks_snapshot_even_if_file_grows) ... ok
+test_invalid_feed_does_not_advance_cursor (test_reliability.ScenarioTests.test_invalid_feed_does_not_advance_cursor) ... ok
+test_invalid_settings_do_not_silently_reset_budget (test_reliability.ScenarioTests.test_invalid_settings_do_not_silently_reset_budget) ... ok
+test_legacy_schema_migration_is_lossless_and_idempotent (test_reliability.ScenarioTests.test_legacy_schema_migration_is_lossless_and_idempotent) ... ok
+test_market_failure_does_not_lose_unchanged_ad (test_reliability.ScenarioTests.test_market_failure_does_not_lose_unchanged_ad) ... ok
+test_missing_release_state_is_not_first_run (test_reliability.ScenarioTests.test_missing_release_state_is_not_first_run) ... ok
+test_pagination_collects_more_than_50_and_deduplicates_overlap (test_reliability.ScenarioTests.test_pagination_collects_more_than_50_and_deduplicates_overlap) ... ok
+test_pagination_failure_preserves_cursor_and_pending_ads (test_reliability.ScenarioTests.test_pagination_failure_preserves_cursor_and_pending_ads) ... ok
+test_preflight_price_changed_does_not_send_old_card (test_reliability.ScenarioTests.test_preflight_price_changed_does_not_send_old_card) ... ok
+test_repeated_evaluation_no_duplicate_and_drop_keeps_history (test_reliability.ScenarioTests.test_repeated_evaluation_no_duplicate_and_drop_keeps_history) ... ok
+test_report_uses_observations_not_confirmed_sales (test_reliability.ScenarioTests.test_report_uses_observations_not_confirmed_sales) ... ok
+test_restore_falls_back_to_previous_committed_snapshot (test_reliability.ScenarioTests.test_restore_falls_back_to_previous_committed_snapshot) ... ok
+test_restore_refuses_while_runner_holds_database_lock (test_reliability.ScenarioTests.test_restore_refuses_while_runner_holds_database_lock) ... ok
+test_restore_valid_snapshot_over_corrupt_working_file (test_reliability.ScenarioTests.test_restore_valid_snapshot_over_corrupt_working_file) ... ok
+test_retention_preserves_versions_and_manual_original (test_reliability.ScenarioTests.test_retention_preserves_versions_and_manual_original) ... ok
+test_retention_refuses_deletion_when_recent_copy_is_corrupt (test_reliability.ScenarioTests.test_retention_refuses_deletion_when_recent_copy_is_corrupt) ... ok
+test_retry_after_is_honored (test_reliability.ScenarioTests.test_retry_after_is_honored) ... ok
+test_revisions_keep_original_description_and_asking_prices (test_reliability.ScenarioTests.test_revisions_keep_original_description_and_asking_prices) ... ok
+test_runner_refuses_missing_db_and_no_secrets_printed (test_reliability.ScenarioTests.test_runner_refuses_missing_db_and_no_secrets_printed) ... ok
+test_send_photo_timeout_does_not_fallback_to_second_message (test_reliability.ScenarioTests.test_send_photo_timeout_does_not_fallback_to_second_message) ... ok
+test_settings_change_cancels_stale_cards_but_allows_reevaluation (test_reliability.ScenarioTests.test_settings_change_cancels_stale_cards_but_allows_reevaluation) ... ok
+test_singleton_lock_released_on_close (test_reliability.ScenarioTests.test_singleton_lock_released_on_close) ... ok
+test_snapshot_roundtrip_includes_settings_and_queues (test_reliability.ScenarioTests.test_snapshot_roundtrip_includes_settings_and_queues) ... ok
+test_unavailable_is_not_a_sale_and_cancels_pending (test_reliability.ScenarioTests.test_unavailable_is_not_a_sale_and_cancels_pending) ... ok
+test_unknown_state_visibility_is_not_assumed_public (test_reliability.ScenarioTests.test_unknown_state_visibility_is_not_assumed_public) ... ok
+test_upload_failure_retains_previous_version (test_reliability.ScenarioTests.test_upload_failure_retains_previous_version) ... ok
+
+----------------------------------------------------------------------
+Ran 35 tests in 6.140s
+
+OK
+Restored verified snapshot: sniper-state-20261126T202833209409Z-e0f5cce4bbb1.zip {'ad_revisions': 0, 'availability_history': 0, 'feed_inbox': 0, 'lot_history': 1, 'market_cache': 0, 'meta': 2, 'ml_ads': 1, 'notification_outbox': 0, 'price_history': 1}
+Restored verified snapshot: sniper-state-20261126T202833768235Z-808f7283d82f.zip {'ad_revisions': 0, 'availability_history': 0, 'feed_inbox': 0, 'lot_history': 1, 'market_cache': 0, 'meta': 2, 'ml_ads': 1, 'notification_outbox': 0, 'price_history': 1}
+🪦 Лот 123: недоступен (http_404); факт продажи неизвестен.
+🪦 Graveyard: проверено 1 (свежих: 0) | ушло: 1 | активно: 0 | цен обновлено: 0 | ошибок: 0
+⚠️ Ошибка проверки 123: RetryAd
+🪦 Graveyard: проверено 1 (свежих: 0) | ушло: 0 | активно: 0 | цен обновлено: 0 | ошибок: 1
+⚠️ Лента: RetryAd; страница не подтверждена.
+⚠️ Лента: HTTP 429; курсор сохранён, повтор позже.
+Snapshot unavailable or invalid; trying an earlier committed snapshot: sniper-state-99999999T000000Z-test.ready.json
+Restored verified snapshot: sniper-state-20261126T202835672573Z-07af71264e43.zip {'ad_revisions': 0, 'availability_history': 0, 'feed_inbox': 0, 'lot_history': 1, 'market_cache': 0, 'meta': 2, 'ml_ads': 1, 'notification_outbox': 0, 'price_history': 1}
+Restored verified snapshot: sniper-state-20261126T202838390028Z-8a0ab87e3712.zip {'ad_revisions': 0, 'availability_history': 0, 'feed_inbox': 0, 'lot_history': 1, 'market_cache': 0, 'meta': 2, 'ml_ads': 1, 'notification_outbox': 0, 'price_history': 1}
