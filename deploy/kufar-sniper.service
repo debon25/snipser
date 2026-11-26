@@ -1,0 +1,33 @@
+[Unit]
+Description=Kufar Sniper single-chat monitor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=kufar
+Group=kufar
+WorkingDirectory=/opt/kufar-sniper/current
+EnvironmentFile=/etc/kufar-sniper.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+Environment=MAX_RUN_HOURS=0
+ExecStart=/opt/kufar-sniper/current/.venv/bin/python runner.py
+Restart=always
+RestartSec=30
+WatchdogSec=300
+TimeoutStartSec=300
+TimeoutStopSec=90
+KillSignal=SIGTERM
+StateDirectory=kufar-sniper
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kufar-sniper
+
+[Install]
+WantedBy=multi-user.target

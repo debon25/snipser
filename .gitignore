@@ -1,0 +1,17 @@
+__pycache__/
+.venv/
+*.py[cod]
+*.db
+*.db-*
+*.db.lock
+*.db.restore-in-progress
+*.sqlite*
+settings.json
+.env
+.env.*
+!.env.example
+state/
+backups/
+*.log
+*.zip
+kufar_db_report.html

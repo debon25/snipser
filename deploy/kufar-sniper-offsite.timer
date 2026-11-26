@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily off-server Sniper snapshot (requires gh and a state repository)
+
+[Timer]
+OnCalendar=*-*-* 01:35:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

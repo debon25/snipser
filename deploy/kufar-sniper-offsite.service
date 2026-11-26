@@ -1,0 +1,18 @@
+[Unit]
+Description=Publish and verify a GitHub Release snapshot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=kufar
+Group=kufar
+WorkingDirectory=/opt/kufar-sniper/current
+EnvironmentFile=/etc/kufar-sniper.env
+EnvironmentFile=/etc/kufar-sniper-backup.env
+ExecStart=/opt/kufar-sniper/current/.venv/bin/python state_store.py save-release --output /var/lib/kufar-sniper/backups
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/kufar-sniper
