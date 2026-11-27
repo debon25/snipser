@@ -1498,7 +1498,7 @@ def send_notification(payload):
         status = str(details.get('status') or details.get('ad_status') or '').lower()
         if details.get('is_active') is False or status in ('deleted','removed','sold','inactive','archived','deactivated'):
             with db_conn:
-                mark_unavailable(db_conn, payload['ad_id'], int(time.time()), 'preflight_inactive')
+                mark_unavailable(db_conn, payload['ad_id'], int(time.time()), details.get('_unavailable_reason', 'preflight_inactive'))
             return dict(cancelled=True, error='ad_unavailable')
         if details.get('price_byn') is not None:
             current = int(details['price_byn']) / 100.0
@@ -1508,7 +1508,7 @@ def send_notification(payload):
                     ad = json.loads(cached[0])
                     ad['price_byn'] = str(round(current * 100))
                     with db_conn:
-                        remember_ads(db_conn, [ad])
+                        remember_ads(db_conn, [ad], source='detail_refresh')
                 return dict(cancelled=True, error='asking_price_changed')
     photo = payload.get('photo_url') if visible_html_len(payload['text']) <= 1020 else None
     method = 'sendPhoto' if photo else 'sendMessage'
@@ -1606,27 +1606,9 @@ def format_desc_for_html(title, desc):
 
 
 def generate_html_db_report(settings):
-    counts = dict(db_conn.execute("SELECT status,COUNT(*) FROM lot_history GROUP BY status").fetchall())
-    stats = dict(total=sum(counts.values()), active=counts.get('active', 0), unavailable=counts.get('unavailable', 0))
-    parts = ["<!doctype html><html lang='ru'><meta charset='utf-8'><title>Kufar Sniper 4.0</title>",
-             "<style>body{font:16px sans-serif;margin:24px;background:#f4f7fa;color:#17212c}table{border-collapse:collapse;width:100%}td,th{padding:8px;border:1px solid #ccc;text-align:left}td{max-width:400px;overflow-wrap:anywhere}</style>",
-             "<h1>Kufar Sniper 4.0 — наблюдения</h1>",
-             f"<p>Всего: {stats['total']}; активны: {stats['active']}; недоступны: {stats['unavailable']}.</p>",
-             "<p>Исчезновение не подтверждает продажу. Цена сделки и срок продажи неизвестны. Старые эвристические значения сохранены отдельно в legacy-полях.</p>",
-             "<h2>Цены активных объявлений</h2><table><tr><th>Модель</th><th>Оценка, BYN</th><th>Выборка</th><th>Медианный возраст активных объявлений, дней</th></tr>"]
-    for r in db_conn.execute("SELECT * FROM market_cache ORDER BY updated_ts DESC"):
-        parts.append(f"<tr><td>{html.escape(r['cache_key'])}</td><td>{r['market_price'] or '—'}</td><td>{r['sample_size']}</td><td>{r['median_days']}</td></tr>")
-    parts.append("</table><h2>Последние 500 наблюдений</h2><table><tr><th>Объявление</th><th>Состояние</th><th>Последняя цена продавца</th><th>Последний раз активно (UTC)</th><th>Недоступность замечена (UTC)</th><th>Описание</th></tr>")
-    for r in db_conn.execute("SELECT * FROM lot_history ORDER BY COALESCE(unavailable_detected_ts,last_seen_ts) DESC LIMIT 500"):
-        def stamp(value):
-            return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M') if value else '—'
-        status = {'active':'Активно', 'unavailable':'Недоступно; причина неизвестна', 'banned':'Исключено фильтром', 'ignored':'Не подходит фильтру'}.get(r['status'], r['status'])
-        parts.append(f"<tr><td><a href='https://www.kufar.by/item/{html.escape(r['ad_id'])}'>{html.escape(r['title'] or r['ad_id'])}</a></td><td>{html.escape(status)}</td><td>{r['last_seen_price']}</td><td>{stamp(r['last_active_ts'])}</td><td>{stamp(r['unavailable_detected_ts'])}</td><td>{html.escape(r['description'] or '')}</td></tr>")
-    parts.append('</table></html>')
+    from reporting import generate_report
     report_path = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), 'kufar_db_report.html')
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write(''.join(parts))
-    return report_path, stats
+    return generate_report(db_conn, settings, report_path)
 
 
 def send_db_report(settings):
@@ -2059,7 +2041,7 @@ def check_graveyard_and_digest(settings, last_update_id):
                     if cached:
                         changed = json.loads(cached[0])
                         changed['price_byn'] = str(round(new_p * 100))
-                        remember_ads(db_conn, [changed], now)
+                        remember_ads(db_conn, [changed], now, source='detail_refresh')
                 else:
                     cur.execute("UPDATE lot_history SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
                     cur.execute("UPDATE ml_ads SET last_seen_ts = ? WHERE ad_id = ?", (now, ad_id))
@@ -2251,9 +2233,8 @@ def get_ad_details(ad_id):
                 time.sleep(3 * (attempt + 1))
                 continue
             elif r.status_code in (404, 410):
-                with db_conn:
-                    mark_unavailable(db_conn, ad_id, int(time.time()), f"http_{r.status_code}")
-                return "", {"is_active": False}, True
+                # The caller records the observation once, with its HTTP evidence.
+                return "", {"is_active": False, "_unavailable_reason": f"http_{r.status_code}"}, True
         except Exception:
             if attempt == 0:
                 time.sleep(1)
@@ -2294,6 +2275,29 @@ def process_ad(ad, settings, last_update_id):
     price_byn = int(ad.get("price_byn") or 0) / 100.0
     if price_byn <= 0:
         return last_update_id
+
+    # A queued listing can be old. Verify the current item before changing any
+    # asking-price history or cancelling an otherwise valid notification.
+    description, detail_res, details_ok = get_ad_details(ad_id)
+    if not details_ok:
+        raise RetryAd('details_unavailable')
+    if detail_res.get('is_active') is False or str(detail_res.get('status') or detail_res.get('ad_status') or '').lower() in ('deleted', 'removed', 'sold', 'inactive', 'archived', 'deactivated'):
+        with db_conn:
+            mark_unavailable(db_conn, ad_id, now_ts, detail_res.get('_unavailable_reason', 'api_inactive'))
+        return last_update_id
+    # Prefer the current title/attributes to an older feed payload too.
+    ad = dict(ad, **{key: detail_res[key] for key in
+                    ('subject', 'ad_parameters', 'images', 'account_id', 'ad_link', 'list_time')
+                    if detail_res.get(key) is not None})
+    if detail_res.get('price_byn') is not None:
+        current_price = int(detail_res['price_byn']) / 100.0
+        if current_price <= 0:
+            return last_update_id
+        if abs(current_price - price_byn) >= 0.01:
+            ad = dict(ad, price_byn=str(round(current_price * 100)))
+            price_byn = current_price
+            with db_conn:
+                remember_ads(db_conn, [ad], source='detail_refresh')
     with db_conn:
         cur.execute("UPDATE notification_outbox SET state='cancelled',last_error='price_changed' WHERE ad_id=? AND price!=? AND state='pending'", (ad_id, price_byn))
 
@@ -2330,7 +2334,7 @@ def process_ad(ad, settings, last_update_id):
                     status = 'active', sold_ts = NULL, estimated_sold_price = NULL
                 WHERE ad_id = ?
             """, (price_byn, drops_cnt, now_ts, ad_id))
-            record_price_event(cur, ad_id, price_byn, now_ts, source="feed_drop")
+            record_price_event(cur, ad_id, price_byn, now_ts, source="item_drop")
             db_conn.commit()
 
             if (total_drop >= 15 and total_drop_pct >= 5.0) or drops_cnt >= 2:
@@ -2364,7 +2368,7 @@ def process_ad(ad, settings, last_update_id):
                     "UPDATE ml_ads SET last_seen_ts = ?, price_byn = ? WHERE ad_id = ?",
                     (now_ts, price_byn, ad_id)
                 )
-            record_price_event(cur, ad_id, price_byn, now_ts, source="feed")
+            record_price_event(cur, ad_id, price_byn, now_ts, source="item")
             db_conn.commit()
 
     raw_title = ad.get("subject", "Без названия")
@@ -2396,25 +2400,6 @@ def process_ad(ad, settings, last_update_id):
         )
         db_conn.commit()
         return last_update_id
-
-    description, detail_res, details_ok = get_ad_details(ad_id)
-    if not details_ok:
-        # Временный сбой API — пропускаем сейчас, чтобы повторить на следующем скане и не потерять описание
-        raise RetryAd("details_unavailable")
-
-    if detail_res.get('is_active') is False or str(detail_res.get('status') or detail_res.get('ad_status') or '').lower() in ('deleted', 'removed', 'sold', 'inactive', 'archived', 'deactivated'):
-        with db_conn:
-            mark_unavailable(db_conn, ad_id, now_ts, 'api_inactive')
-        return last_update_id
-    if detail_res.get('price_byn') is not None:
-        current_price = int(detail_res['price_byn']) / 100.0
-        if current_price <= 0:
-            return last_update_id
-        if abs(current_price - price_byn) >= 0.01:
-            refreshed = dict(ad, price_byn=str(round(current_price * 100)))
-            with db_conn:
-                remember_ads(db_conn, [refreshed])
-            raise RetryAd('asking_price_changed')
 
     full_params = (detail_res.get("ad_parameters") if isinstance(detail_res, dict) and detail_res.get("ad_parameters") else ad_params) or []
     full_text = f"{raw_title}\n{description}"
@@ -2525,13 +2510,13 @@ def process_ad(ad, settings, last_update_id):
     mark_active(db_conn, ad_id, now_ts)
     db_conn.commit()
 
-    m_data = get_market_data(phone_info, settings)
-    if not m_data:
-        raise RetryAd("market_data_unavailable")
-
     if price_byn < settings.get("min_price", 120) or price_byn > settings.get("max_price", 750):
         print(f"💼 [В базу, вне бюджета TG ({settings['min_price']}–{settings['max_price']}): {price_byn:.0f} р.] {phone_info['key']}")
         return last_update_id
+
+    m_data = get_market_data(phone_info, settings)
+    if not m_data:
+        raise RetryAd("market_data_unavailable")
 
     base_market = m_data["price"]
     adj_market, cond_note, has_defects = adjust_lot_market_price(
@@ -2705,7 +2690,7 @@ def main():
         now_ts = int(time.time())
 
         batch_deadline = time.monotonic() + 30
-        for ad in ads[:max(1,min(25,int(os.getenv('PROCESS_BATCH_SIZE','10'))))]:
+        for processed, ad in enumerate(ads[:max(2,min(25,int(os.getenv('PROCESS_BATCH_SIZE','10'))))], 1):
             if not RUNNING:
                 break
             watchdog()
@@ -2719,7 +2704,7 @@ def main():
                 finish_ad(db_conn, str(ad['ad_id']), type(exc).__name__ + (':' + str(exc) if isinstance(exc, RetryAd) else ''))
                 print(f"⚠️ Лот {ad.get('ad_id')}: {type(exc).__name__}; остаётся в очереди.")
             drain_outbox(db_conn, send_notification, limit=1)
-            if time.monotonic() >= batch_deadline:
+            if processed >= 2 and time.monotonic() >= batch_deadline:
                 break
         set_meta('heartbeat_ts', int(time.time()))
 

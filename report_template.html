@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kufar Sniper — База / Стата</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 16px; }
+  .wrap { max-width: 1280px; margin: 0 auto; min-width: 0; }
+  h1 { font-size: 22px; margin: 0 0 6px; color: #f8fafc; }
+  .sub { color: #94a3b8; font-size: 13px; margin-bottom: 18px; line-height: 1.5; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; margin-bottom: 20px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 12px; }
+  .card .lbl { font-size: 12px; color: #94a3b8; }
+  .card .val { font-size: 22px; font-weight: 700; margin-top: 4px; color: #f8fafc; }
+  .card .val.fire { color: #fb923c; }
+  .card .val.green { color: #4ade80; }
+  .search { width: 100%; box-sizing: border-box; padding: 10px 14px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #f8fafc; font-size: 14px; margin-bottom: 18px; }
+  h2 { font-size: 16px; margin: 22px 0 10px; color: #cbd5e1; }
+  .tbl-wrap { overflow-x: auto; background: #1e293b; border: 1px solid #334155; border-radius: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid #334155; white-space: nowrap; vertical-align: top; }
+  th { background: #0f172a; color: #94a3b8; font-weight: 600; }
+  tr:hover { background: #263348; }
+  a { color: #38bdf8; text-decoration: none; }
+  .muted { color: #94a3b8; font-size: 12px; }
+  .desc-cell { white-space: normal; min-width: 240px; max-width: 420px; font-size: 12px; color: #cbd5e1; line-height: 1.35; overflow-wrap: anywhere; }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge.fire { background: #7c2d12; color: #fdba74; }
+  .badge.green { background: #14532d; color: #86efac; }
+  .badge.blue { background: #1e3a8a; color: #93c5fd; }
+  .badge.gray { background: #334155; color: #cbd5e1; }
+  .note { margin-top: -8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📦 База данных Kufar Sniper</h1>
+  <div class="sub">Сформировано: $now (Минск) · Состояние объявлений — по последней проверке.<br>
+    Исчезновение не подтверждает продажу. Цена сделки и срок продажи неизвестны.</div>
+  <div class="grid">
+    <div class="card"><div class="lbl">Всего записей</div><div class="val">$total</div></div>
+    <div class="card"><div class="lbl">Объявлений в датасете</div><div class="val">$dataset</div></div>
+    <div class="card"><div class="lbl">Активные лоты</div><div class="val green">$active</div></div>
+    <div class="card"><div class="lbl">Недоступны / старые отметки</div><div class="val">$unavailable</div></div>
+    <div class="card"><div class="lbl">Записей истории цен</div><div class="val">$prices</div></div>
+    <div class="card"><div class="lbl">Ожидают обработки</div><div class="val fire">$processing</div></div>
+  </div>
+  <div class="sub note">⛔ Исключены фильтром: $banned · Прочие неподходящие: $ignored · Ожидают отправки: $sending</div>
+  <label for="q" class="muted">Поиск по всем таблицам</label>
+  <input id="q" class="search" type="search" placeholder="🔎 Модель, память, район или слова в описании..." oninput="filterRows()">
+  <h2>📊 Рынок по моделям — цены объявлений</h2>
+  <div class="tbl-wrap"><table id="market">
+    <thead><tr><th>Модель</th><th>Витрина</th><th>Итоговая оценка</th><th>Медианный возраст<br>активной выборки</th><th>Оценка обновлена</th></tr></thead>
+    <tbody>$model_rows</tbody>
+  </table></div>
+  <div class="sub">Оценка по предложениям продавцов; фактические цены сделок неизвестны. Возраст выборки не показывает срок продажи.</div>
+  <h2>🏁 Недоступные объявления за последние 30 дней</h2>
+  <div class="tbl-wrap"><table id="unavailable">
+    <thead><tr><th>Отмечено (Минск)</th><th>Состояние</th><th>Модель</th><th>АКБ</th><th>Последняя цена<br>продавца</th><th>Последний раз<br>активно (Минск)</th><th>Возраст при<br>последней проверке</th><th>Описание</th></tr></thead>
+    <tbody>$unavailable_rows</tbody>
+  </table></div>
+  <div class="sub">До 1000 записей. «Старая отметка» перенесена из прежней версии и не подтверждает дату исчезновения. АКБ — из текста продавца.</div>
+  <h2>📱 Последние 100 активных лотов</h2>
+  <div class="tbl-wrap"><table id="active">
+    <thead><tr><th>Модель</th><th>АКБ</th><th>Район</th><th>Цена</th><th>Возраст при<br>последней проверке</th><th>Описание</th></tr></thead>
+    <tbody>$active_rows</tbody>
+  </table></div>
+  <div class="sub">Объявление может измениться после проверки. Полная история хранится в SQLite; отчёт показывает последние наблюдения.</div>
+</div>
+<script>
+function filterRows() {
+  const tokens = document.getElementById('q').value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+  document.querySelectorAll('tbody tr').forEach(tr => {
+    const txt = tr.innerText.toLowerCase();
+    const ok = tokens.every(t => txt.includes(t));
+    tr.style.display = ok ? '' : 'none';
+  });
+}
+</script>
+</body>
+</html>

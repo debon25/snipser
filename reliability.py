@@ -17,6 +17,17 @@ def event_key(ad_id, price):
     return f"{ad_id}:{round(price * 100)}"
 
 
+def listing_priority(ad, now):
+    """Listing time, not the time an older pagination page was downloaded."""
+    try:
+        value = datetime.fromisoformat(str(ad.get('list_time') or '').replace('Z', '+00:00'))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return min(int(value.timestamp()), now)
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
 def migrate(conn):
     with conn:
         for table in ("lot_history", "ml_ads"):
@@ -58,6 +69,12 @@ def migrate(conn):
             );
             CREATE INDEX IF NOT EXISTS idx_revisions_ad_time ON ad_revisions(ad_id,observed_ts);
         """)
+        if 'priority_ts' not in {row[1] for row in conn.execute('PRAGMA table_info(feed_inbox)')}:
+            conn.execute('ALTER TABLE feed_inbox ADD COLUMN priority_ts INTEGER NOT NULL DEFAULT 0')
+            for row in conn.execute('SELECT ad_id,payload,observed_ts FROM feed_inbox').fetchall():
+                conn.execute('UPDATE feed_inbox SET priority_ts=? WHERE ad_id=?',
+                             (listing_priority(json.loads(row['payload']), row['observed_ts']), row['ad_id']))
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_inbox_priority ON feed_inbox(state,attempts,priority_ts DESC)')
         if conn.execute("SELECT 1 FROM meta WHERE key='migration_v40_done'").fetchone():
             return
         for table in ("lot_history", "ml_ads"):
@@ -104,7 +121,7 @@ def migrate(conn):
         conn.execute("INSERT INTO meta VALUES ('migration_v40_done',?)", (str(int(time.time())),))
 
 
-def remember_ads(conn, ads, now=None):
+def remember_ads(conn, ads, now=None, source='feed'):
     """Persist raw ads before acknowledging a pagination cursor."""
     now = int(now or time.time())
     for ad in ads:
@@ -114,15 +131,15 @@ def remember_ads(conn, ads, now=None):
         payload = json.dumps(ad, sort_keys=True, ensure_ascii=False)
         digest = hashlib.sha256(payload.encode()).hexdigest()
         conn.execute("""INSERT OR IGNORE INTO ad_revisions
-            (ad_id,source,fingerprint,observed_ts,payload) VALUES (?,'feed',?,?,?)""", (ad_id, digest, now, payload))
+            (ad_id,source,fingerprint,observed_ts,payload) VALUES (?,?,?,?,?)""", (ad_id, source, digest, now, payload))
         was_unavailable = conn.execute("SELECT 1 FROM lot_history WHERE ad_id=? AND status='unavailable'", (ad_id,)).fetchone()
-        conn.execute("""INSERT INTO feed_inbox(ad_id,payload,fingerprint,observed_ts)
-            VALUES (?,?,?,?) ON CONFLICT(ad_id) DO UPDATE SET
-            payload=excluded.payload, observed_ts=excluded.observed_ts,
+        conn.execute("""INSERT INTO feed_inbox(ad_id,payload,fingerprint,observed_ts,priority_ts)
+            VALUES (?,?,?,?,?) ON CONFLICT(ad_id) DO UPDATE SET
+            payload=excluded.payload, observed_ts=excluded.observed_ts,priority_ts=excluded.priority_ts,
             state=CASE WHEN feed_inbox.fingerprint!=excluded.fingerprint THEN 'pending' ELSE feed_inbox.state END,
             next_attempt_ts=CASE WHEN feed_inbox.fingerprint!=excluded.fingerprint THEN 0 ELSE feed_inbox.next_attempt_ts END,
             attempts=CASE WHEN feed_inbox.fingerprint!=excluded.fingerprint THEN 0 ELSE feed_inbox.attempts END,
-            fingerprint=excluded.fingerprint""", (ad_id, payload, digest, now))
+            fingerprint=excluded.fingerprint""", (ad_id, payload, digest, now, listing_priority(ad, now)))
         if was_unavailable:
             conn.execute("UPDATE feed_inbox SET state='pending',next_attempt_ts=0 WHERE ad_id=?", (ad_id,))
         for table in ('lot_history', 'ml_ads'):
@@ -130,9 +147,24 @@ def remember_ads(conn, ads, now=None):
 
 
 def pending_ads(conn, limit=100, now=None):
-    return [json.loads(r[0]) for r in conn.execute("""SELECT payload FROM feed_inbox
-        WHERE state='pending' AND next_attempt_ts<=? ORDER BY attempts,observed_ts DESC,ad_id DESC LIMIT ?""",
-        (int(now or time.time()), limit))]
+    now = int(now or time.time())
+    fresh = iter(conn.execute("""SELECT payload FROM feed_inbox
+        WHERE state='pending' AND attempts=0 AND next_attempt_ts<=?
+        ORDER BY priority_ts DESC,observed_ts,ad_id LIMIT ?""", (now, limit)).fetchall())
+    retries = iter(conn.execute("""SELECT payload FROM feed_inbox
+        WHERE state='pending' AND attempts>0 AND next_attempt_ts<=?
+        ORDER BY next_attempt_ts,priority_ts DESC,ad_id LIMIT ?""", (now, limit)).fetchall())
+    result = []
+    # At least one due retry in each five slots; a busy backfill cannot starve it.
+    for slot in range(limit):
+        first, second = (retries, fresh) if slot % 5 == 1 else (fresh, retries)
+        row = next(first, None)
+        if row is None:
+            row = next(second, None)
+        if row is None:
+            break
+        result.append(json.loads(row[0]))
+    return result
 
 
 def remember_detail(conn, ad_id, details, now=None):
@@ -164,8 +196,10 @@ def queue_notification(conn, ad_id, price, text, photo_url=None, with_sound=Fals
     conn.execute("""INSERT OR IGNORE INTO notification_outbox
         (event_key,ad_id,price,payload,created_ts) VALUES (?,?,?,?,?)""",
         (key, ad_id, price, payload, int(time.time())))
-    conn.execute("""UPDATE notification_outbox SET state='pending',payload=?,next_attempt_ts=0,
-        last_error=NULL WHERE event_key=? AND state='cancelled'""", (payload, key))
+    conn.execute("""UPDATE notification_outbox SET payload=?,
+        next_attempt_ts=CASE WHEN state='cancelled' THEN 0 ELSE next_attempt_ts END,
+        last_error=CASE WHEN state='cancelled' THEN NULL ELSE last_error END,
+        state='pending' WHERE event_key=? AND state IN ('pending','cancelled')""", (payload, key))
 
 
 def drain_outbox(conn, sender, limit=5, now=None):

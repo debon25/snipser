@@ -123,6 +123,70 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 1)
         self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0], 1)
 
+    def test_stale_feed_does_not_change_price_when_details_fail(self):
+        self.seed()
+        with self.conn:
+            r.queue_notification(self.conn, '123', 300, 'current card')
+        with patch.object(self.bot, 'get_ad_details', return_value=('', {}, False)):
+            with self.assertRaises(r.RetryAd):
+                self.bot.process_ad(self.ad(price=320), self.bot.DEFAULT_SETTINGS.copy(), 0)
+        self.assertEqual(self.conn.execute('SELECT last_seen_price FROM lot_history').fetchone()[0], 300)
+        self.assertEqual(self.conn.execute('SELECT price_byn FROM ml_ads').fetchone()[0], 300)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0], 1)
+        self.assertEqual(self.conn.execute('SELECT state FROM notification_outbox').fetchone()[0], 'pending')
+
+    def test_current_detail_price_wins_without_false_history_or_duplicate(self):
+        self.seed()
+        with self.conn:
+            r.remember_ads(self.conn, [self.ad(price=320)])
+            r.queue_notification(self.conn, '123', 300, 'current card')
+        with patch.object(self.bot, 'get_ad_details', return_value=('Рабочий телефон', {'is_active': True, 'price_byn': '30000'}, True)), \
+             patch.object(self.bot, 'get_market_data', return_value=self.market()):
+            self.bot.process_ad(self.ad(price=320), self.bot.DEFAULT_SETTINGS.copy(), 0)
+        self.assertEqual(self.conn.execute('SELECT last_seen_price FROM lot_history').fetchone()[0], 300)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0], 1)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 1)
+        self.assertEqual(self.conn.execute('SELECT price FROM notification_outbox').fetchone()[0], 300)
+        self.assertEqual(json.loads(self.conn.execute('SELECT payload FROM feed_inbox').fetchone()[0])['price_byn'], '30000')
+
+    def test_processing_404_records_one_observation(self):
+        self.seed()
+        with patch.object(self.bot.kufar_session, 'get', return_value=response(code=404)):
+            self.bot.process_ad(self.ad(price=320), self.bot.DEFAULT_SETTINGS.copy(), 0)
+        rows = self.conn.execute('SELECT evidence FROM availability_history').fetchall()
+        self.assertEqual([row[0] for row in rows], ['http_404'])
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0], 1)
+
+    def test_current_title_is_used_for_model_and_memory(self):
+        with patch.object(self.bot, 'get_ad_details', return_value=('Рабочий телефон',
+                {'is_active': True, 'subject': 'iPhone 13 256GB', 'price_byn': '30000'}, True)), \
+             patch.object(self.bot, 'get_market_data', return_value=self.market()):
+            self.bot.process_ad(self.ad(), self.bot.DEFAULT_SETTINGS.copy(), 0)
+        row = self.conn.execute('SELECT model,memory,title FROM lot_history').fetchone()
+        self.assertEqual(tuple(row), ('iPhone 13', 256, 'iPhone 13 256GB'))
+        self.assertEqual(self.conn.execute('SELECT subject FROM ml_ads').fetchone()[0], 'iPhone 13 256GB')
+
+    def test_outside_notification_budget_saves_data_without_market_requests(self):
+        with patch.object(self.bot, 'get_market_data') as market:
+            self.process(self.ad(price=1000))
+        market.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT price_byn FROM ml_ads').fetchone()[0], 1000)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM price_history').fetchone()[0], 1)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM notification_outbox').fetchone()[0], 0)
+
+    def test_due_retries_share_batch_with_newest_listings(self):
+        retry = self.ad(ad_id='retry')
+        fresh = self.ad(ad_id='fresh')
+        old = [dict(self.ad(ad_id=str(i)), list_time='2026-10-01T10:00:00Z') for i in range(30)]
+        with self.conn:
+            r.remember_ads(self.conn, [retry, fresh], now=1_800_000_000)
+            r.remember_ads(self.conn, old, now=1_800_000_001)
+        r.finish_ad(self.conn, 'retry', 'temporary', now=1_800_000_001)
+        ids = [ad['ad_id'] for ad in r.pending_ads(self.conn, limit=10, now=1_800_000_100)]
+        self.assertIn('retry', ids[:2])
+        self.assertIn('fresh', ids[:2])
+        self.assertEqual(len(ids), len(set(ids)))
+
     def test_failed_send_survives_restart_then_sends_once(self):
         self.seed()
         with self.conn:
@@ -139,6 +203,28 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(sender.call_count, 2)
         row = self.conn.execute('SELECT state,message_id FROM notification_outbox').fetchone()
         self.assertEqual(tuple(row), ('sent', 42))
+        self.assertEqual(self.conn.execute('SELECT notified FROM lot_history').fetchone()[0], 1)
+
+    def test_pending_card_refresh_keeps_retry_delay_and_sent_card_is_immutable(self):
+        self.seed()
+        with self.conn:
+            r.queue_notification(self.conn, '123', 300, 'old description')
+        sender = Mock(return_value=dict(ok=False, error='http_429', retry_after=120))
+        r.drain_outbox(self.conn, sender, now=1000)
+        with self.conn:
+            r.queue_notification(self.conn, '123', 300, 'current description')
+        row = self.conn.execute('SELECT * FROM notification_outbox').fetchone()
+        self.assertEqual(json.loads(row['payload'])['text'], 'current description')
+        self.assertEqual((row['attempts'], row['next_attempt_ts']), (1, 1120))
+        r.drain_outbox(self.conn, sender, now=1119)
+        self.assertEqual(sender.call_count, 1)
+        sender.return_value = dict(ok=True, message_id=42)
+        r.drain_outbox(self.conn, sender, now=1120)
+        with self.conn:
+            r.queue_notification(self.conn, '123', 300, 'third description')
+        row = self.conn.execute('SELECT state,message_id,payload FROM notification_outbox').fetchone()
+        self.assertEqual(json.loads(row['payload'])['text'], 'current description')
+        self.assertEqual(tuple(row)[:2], ('sent', 42))
         self.assertEqual(self.conn.execute('SELECT notified FROM lot_history').fetchone()[0], 1)
 
     def test_retry_after_is_honored(self):
@@ -342,6 +428,56 @@ class ScenarioTests(unittest.TestCase):
         self.assertIn('Исчезновение не подтверждает продажу',report)
         self.assertNotIn('Реальные продажи',report)
         self.assertEqual(stats['unavailable'],1)
+
+    def test_report_escapes_listing_text_and_keeps_links_on_kufar(self):
+        ad_id = '../"><img src=x onerror=alert(1)>'
+        self.seed(ad_id=ad_id)
+        with self.conn:
+            self.conn.execute('UPDATE lot_history SET title=?,description=?,district=? WHERE ad_id=?',
+                              ('<script>alert(1)</script>', 'Камера <img onerror=alert(2)> $total', '<b>район</b>', ad_id))
+        path, _ = self.bot.generate_html_db_report(self.bot.DEFAULT_SETTINGS.copy())
+        report = Path(path).read_text(encoding='utf-8')
+        self.assertEqual(report.count('<script>'), 1)  # only the report's search script
+        self.assertNotIn('<img', report)
+        self.assertIn('&lt;script&gt;', report)
+        self.assertIn('$total', report)  # user text cannot substitute template values
+        self.assertIn('https://www.kufar.by/item/..%2F%22%3E%3Cimg', report)
+
+    def test_empty_report_and_zero_day_sample_are_displayed(self):
+        path, stats = self.bot.generate_html_db_report(self.bot.DEFAULT_SETTINGS.copy())
+        self.assertEqual(stats['total'], 0)
+        self.assertEqual(Path(path).read_text(encoding='utf-8').count('Пока нет данных'), 3)
+        self.seed()
+        with self.conn:
+            self.conn.execute('UPDATE lot_history SET list_time_ts=last_active_ts')
+            self.conn.execute("INSERT INTO market_cache(cache_key,market_price,sample_size,median_days) VALUES ('iPhone 12_128GB',450,10,0)")
+        path, _ = self.bot.generate_html_db_report(self.bot.DEFAULT_SETTINGS.copy())
+        report = Path(path).read_text(encoding='utf-8')
+        self.assertGreaterEqual(report.count('0.0 дн.'), 2)
+        self.assertIn('background: #0f172a', report)
+
+    def test_outbox_preflight_404_does_not_send_or_double_count(self):
+        self.seed()
+        with self.conn:
+            r.queue_notification(self.conn, '123', 300, 'card')
+        with patch.object(self.bot, 'TG_TOKEN', 'not-real'), patch.object(self.bot, 'TG_CHAT_ID', '1'), \
+             patch.object(self.bot.kufar_session, 'get', return_value=response(code=404)), \
+             patch.object(self.bot.tg_session, 'post') as post:
+            r.drain_outbox(self.conn, self.bot.send_notification, now=int(time.time()) + 1)
+        post.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM availability_history').fetchone()[0], 1)
+        self.assertEqual(self.conn.execute('SELECT evidence FROM availability_history').fetchone()[0], 'http_404')
+        self.assertEqual(self.conn.execute('SELECT state FROM notification_outbox').fetchone()[0], 'cancelled')
+
+    def test_db_menu_works_only_for_authorized_chat(self):
+        for command in ('/db', '📦 База / Стата'):
+            updates = [{'update_id': i, 'message': {'chat': {'id': chat}, 'text': command}}
+                       for i, chat in enumerate((99, 1), 1)]
+            with patch.object(self.bot, 'TG_TOKEN', 'not-real'), patch.object(self.bot, 'TG_CHAT_ID', '1'), \
+                 patch.object(self.bot.tg_session, 'get', return_value=response(data={'result': updates})), \
+                 patch.object(self.bot, 'send_db_report') as report:
+                self.bot.handle_telegram_updates(0, self.bot.DEFAULT_SETTINGS.copy(), force=True)
+            report.assert_called_once()
 
     def test_failed_shift_blocks_stale_state_until_explicit_recovery(self):
         self.seed()
